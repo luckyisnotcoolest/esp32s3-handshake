@@ -1,4 +1,4 @@
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  HandshakeSniffer v1.3 — GitHub Actions build
 #  Target : ESP32-S3 N16R8 (OPI PSRAM, 16MB flash)
 #  Toolchain : arduino-cli + arduino-esp32 3.3.5 (IDF 5.5.x)
@@ -22,13 +22,13 @@
 #         the async variant. Missing this was the v1.2 compile failure.
 #       - Adafruit NeoPixel (via arduino-cli lib install)
 #
-#  Build log reference: esp32:esp-x32@2511 is the toolchain package name
-#  for core 3.3.5. objcopy lives under esp-x32/*/bin/. The find command
-#  searches all subdirs — works regardless of version number in path.
+#  Build log reference: esp32:esp32@3.3.5 is the core version.
+#  objcopy lives under toolchain/bin/. The find command searches all subdirs —
+#  works regardless of version number in path.
 #
 #  ARTIFACTS:
 #     build/  — merged.bin (flash at 0x0) + elf + map
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 name: Build HandshakeSniffer v1.3
 
@@ -68,51 +68,25 @@ jobs:
           arduino-cli core list
 
       # ── 4. Install 3rd-party libraries ───────────────────────────────────
-      # IMPORTANT: AsyncDNSServer must be from ESP32Async fork, not from
-      # lacamera or any other fork. Only the ESP32Async fork builds cleanly
-      # against arduino-esp32 core 3.x (IDF 5.x API).
+      # CRITICAL: AsyncDNSServer must be from ESP32Async fork.
+      # Only this fork builds cleanly against arduino-esp32 core 3.x (IDF 5.x API).
       - name: Install libraries
         run: |
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
 
-          # Configure git for improved network reliability
-          git config --global http.postBuffer 1048576000
-          git config --global http.lowSpeedLimit 1000
-          git config --global http.lowSpeedTime 60
-
-          # Retry function for git clone operations (handles transient network failures)
-          retry_git_clone() {
-            local url="$1"
-            local dest="$2"
-            local retries=5
-            local count=0
-            until git clone --depth 1 "$url" "$dest"; do
-              count=$((count + 1))
-              if [ $count -lt $retries ]; then
-                echo "Clone failed. Retrying in 10 seconds... (attempt $count/$retries)"
-                sleep 10
-              else
-                echo "FATAL: Failed to clone after $retries attempts"
-                return 1
-              fi
-            done
-          }
-
-          retry_git_clone "https://github.com/ESP32Async/AsyncTCP.git" "$LIBDIR/AsyncTCP"
-          retry_git_clone "https://github.com/ESP32Async/ESPAsyncWebServer.git" "$LIBDIR/ESPAsyncWebServer"
-          # AsyncDNSServer — required for captive portal (AsyncDNSServer.h)
-          # NOT the built-in DNSServer — this sketch uses the async variant
-          retry_git_clone "https://github.com/ESP32Async/AsyncDNSServer.git" "$LIBDIR/AsyncDNSServer"
+          git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git \
+            "$LIBDIR/AsyncTCP"
+          git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git \
+            "$LIBDIR/ESPAsyncWebServer"
+          git clone --depth 1 https://github.com/ESP32Async/AsyncDNSServer.git \
+            "$LIBDIR/AsyncDNSServer"
 
           arduino-cli lib install "Adafruit NeoPixel"
 
           echo "=== Installed libraries ===" && ls "$LIBDIR"
 
       # ── 5. Locate toolchain + libnet80211.a ──────────────────────────────
-      # Search all tool subdirs — the folder name under /tools/ changed across
-      # core versions (esp-x32 in 3.3.5, may change in later versions).
-      # Using find without a fixed parent folder makes this future-proof.
       - name: Locate toolchain paths
         run: |
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
