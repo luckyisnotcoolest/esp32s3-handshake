@@ -246,37 +246,18 @@ jobs:
           echo "ESPAsyncWebServer @ $(git -C $LIB_DIR/ESPAsyncWebServer rev-parse --short HEAD) (${{ env.ASYNCWEBSERVER_VERSION }})"
 
       - name: Install AsyncDNSServer_ESP32
-        # Library Manager may not contain AsyncDNSServer_ESP32 anymore.
-        # Keep the Library Manager install as the first choice, but fall back
-        # to the maintained GitHub source if the package is unavailable.
+        # lacamera/AsyncDNSServer_ESP32 is the correct source — it ships
+        # AsyncDNSServer.h directly (the header the sketch includes).
+        # The Library Manager entry for this package is unreliable in CI
+        # (candidates: [] in recent runner images), so clone from source.
         run: |
           LIB_DIR="$HOME/Arduino/libraries"
           mkdir -p "$LIB_DIR"
-
-          if arduino-cli lib install "${{ env.ASYNCDNS_LIB_NAME }}"; then
-            echo "AsyncDNSServer_ESP32 installed via arduino-cli"
-          else
-            echo "Library Manager could not find ${ASYNCDNS_LIB_NAME}."
-            echo "Falling back to ESPAsyncDNSServer from GitHub..."
-
-            rm -rf "$LIB_DIR/ESPAsyncDNSServer"
-            git clone --depth=1 \
-              https://github.com/devyte/ESPAsyncDNSServer.git \
-              "$LIB_DIR/ESPAsyncDNSServer"
-
-            echo "ESPAsyncDNSServer installed from GitHub:"
-            git -C "$LIB_DIR/ESPAsyncDNSServer" rev-parse --short HEAD
-
-            # Expose the library under both names the sketch may include:
-            #   <AsyncDNSServer_ESP32.h>  — explicit include style
-            #   <AsyncDNSServer.h>        — what HandshakeSniffer.ino uses
-            if [ -f "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" ]; then
-              cp "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" \
-                 "$LIB_DIR/ESPAsyncDNSServer/AsyncDNSServer_ESP32.h"
-              cp "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" \
-                 "$LIB_DIR/ESPAsyncDNSServer/AsyncDNSServer.h"
-            fi
-          fi
+          rm -rf "$LIB_DIR/AsyncDNSServer_ESP32"
+          git clone --depth=1 \
+            https://github.com/lacamera/AsyncDNSServer_ESP32.git \
+            "$LIB_DIR/AsyncDNSServer_ESP32"
+          echo "AsyncDNSServer_ESP32 @ $(git -C $LIB_DIR/AsyncDNSServer_ESP32 rev-parse --short HEAD)"
 
       - name: Install Adafruit NeoPixel
         run: |
