@@ -1,4 +1,4 @@
-# ═════════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  HandshakeSniffer v1.3 — GitHub Actions build
 #  Target : ESP32-S3 N16R8 (OPI PSRAM, 16MB flash)
 #  Toolchain : arduino-cli + arduino-esp32 3.3.5 (IDF 5.5.x)
@@ -28,7 +28,7 @@
 #
 #  ARTIFACTS:
 #     build/  — merged.bin (flash at 0x0) + elf + map
-# ═════════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 name: Build HandshakeSniffer v1.3
 
@@ -76,17 +76,22 @@ jobs:
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
 
+          # Configure git for improved network reliability
+          git config --global http.postBuffer 1048576000
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+
           # Retry function for git clone operations (handles transient network failures)
           retry_git_clone() {
             local url="$1"
             local dest="$2"
-            local retries=3
+            local retries=5
             local count=0
             until git clone --depth 1 "$url" "$dest"; do
               count=$((count + 1))
               if [ $count -lt $retries ]; then
-                echo "Clone failed. Retrying in 5 seconds... (attempt $count/$retries)"
-                sleep 5
+                echo "Clone failed. Retrying in 10 seconds... (attempt $count/$retries)"
+                sleep 10
               else
                 echo "FATAL: Failed to clone after $retries attempts"
                 return 1
