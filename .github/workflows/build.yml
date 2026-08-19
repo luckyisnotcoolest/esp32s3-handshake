@@ -233,31 +233,39 @@ jobs:
           LIB_DIR="$HOME/Arduino/libraries"
           mkdir -p "$LIB_DIR"
           rm -rf "$LIB_DIR/AsyncTCP"
-          git clone --depth=1 --branch ${{ env.ASYNCTCP_VERSION }} \
-            https://github.com/ESP32Async/AsyncTCP.git "$LIB_DIR/AsyncTCP"
-          echo "AsyncTCP @ $(git -C $LIB_DIR/AsyncTCP rev-parse --short HEAD) (${{ env.ASYNCTCP_VERSION }})"
+          curl -fsSL \
+            https://github.com/ESP32Async/AsyncTCP/archive/refs/tags/${{ env.ASYNCTCP_VERSION }}.zip \
+            -o /tmp/AsyncTCP.zip
+          unzip -q /tmp/AsyncTCP.zip -d /tmp/
+          mv /tmp/AsyncTCP-$(echo "${{ env.ASYNCTCP_VERSION }}" | sed 's/^v//') "$LIB_DIR/AsyncTCP"
+          echo "AsyncTCP ${{ env.ASYNCTCP_VERSION }} installed"
 
       - name: Install ESP32Async/ESPAsyncWebServer
         run: |
           LIB_DIR="$HOME/Arduino/libraries"
           rm -rf "$LIB_DIR/ESPAsyncWebServer"
-          git clone --depth=1 --branch ${{ env.ASYNCWEBSERVER_VERSION }} \
-            https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIB_DIR/ESPAsyncWebServer"
-          echo "ESPAsyncWebServer @ $(git -C $LIB_DIR/ESPAsyncWebServer rev-parse --short HEAD) (${{ env.ASYNCWEBSERVER_VERSION }})"
+          curl -fsSL \
+            https://github.com/ESP32Async/ESPAsyncWebServer/archive/refs/tags/${{ env.ASYNCWEBSERVER_VERSION }}.zip \
+            -o /tmp/ESPAsyncWebServer.zip
+          unzip -q /tmp/ESPAsyncWebServer.zip -d /tmp/
+          mv /tmp/ESPAsyncWebServer-$(echo "${{ env.ASYNCWEBSERVER_VERSION }}" | sed 's/^v//') "$LIB_DIR/ESPAsyncWebServer"
+          echo "ESPAsyncWebServer ${{ env.ASYNCWEBSERVER_VERSION }} installed"
 
       - name: Install AsyncDNSServer_ESP32
-        # lacamera/AsyncDNSServer_ESP32 is the correct source — it ships
-        # AsyncDNSServer.h directly (the header the sketch includes).
-        # The Library Manager entry for this package is unreliable in CI
-        # (candidates: [] in recent runner images), so clone from source.
+        # lacamera/AsyncDNSServer_ESP32 ships AsyncDNSServer.h directly.
+        # git clone fails on some runners (auth/device error on HTTPS);
+        # download the zip with curl instead — no git credential dance needed.
         run: |
           LIB_DIR="$HOME/Arduino/libraries"
           mkdir -p "$LIB_DIR"
           rm -rf "$LIB_DIR/AsyncDNSServer_ESP32"
-          git clone --depth=1 \
-            https://github.com/lacamera/AsyncDNSServer_ESP32.git \
-            "$LIB_DIR/AsyncDNSServer_ESP32"
-          echo "AsyncDNSServer_ESP32 @ $(git -C $LIB_DIR/AsyncDNSServer_ESP32 rev-parse --short HEAD)"
+          curl -fsSL \
+            https://github.com/lacamera/AsyncDNSServer_ESP32/archive/refs/heads/master.zip \
+            -o /tmp/AsyncDNSServer_ESP32.zip
+          unzip -q /tmp/AsyncDNSServer_ESP32.zip -d /tmp/
+          mv /tmp/AsyncDNSServer_ESP32-master "$LIB_DIR/AsyncDNSServer_ESP32"
+          echo "AsyncDNSServer_ESP32 installed:"
+          ls "$LIB_DIR/AsyncDNSServer_ESP32/"
 
       - name: Install Adafruit NeoPixel
         run: |
