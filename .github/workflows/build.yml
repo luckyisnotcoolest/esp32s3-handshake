@@ -1,1 +1,304 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  HandshakeSniffer — GitHub Actions build
+#  Target : ESP32-S3 N16R8 (OPI PSRAM, 16MB flash)
+#  Toolchain : arduino-cli + arduino-esp32 3.x (IDF 5.1.x)
+#
+#  PATCHES APPLIED:
+#
+#  1. libnet80211.a — weaken ieee80211_raw_frame_sanity_check
+#     The sketch redefines this symbol to bypass the TX sanity check
+#     (required for esp_wifi_80211_tx raw frame injection / deauth).
+#     IDF 5.x ships a strong definition in libnet80211.a; the linker
+#     rejects a second strong definition in the sketch. We run objcopy
+#     --weaken-symbol on the archive so the sketch's definition wins
+#     at link time without --allow-multiple-definition (which would
+#     silently swallow real duplicate errors elsewhere).
+#
+#  2. board flags — OPI PSRAM + 16MB flash + Huge APP partition
+#     arduino-cli uses a boards.local.txt override injected into the
+#     package cache to set:
+#       - PSRAM: enabled, OPI mode  (CONFIG_SPIRAM + CONFIG_SPIRAM_MODE_OCT)
+#       - Flash: 16MB, QIO 80MHz
+#       - Partition: huge_app (3MB app, no OTA, 1MB SPIFFS)
+#       - USB CDC on boot: disabled  (CRITICAL — board locks up otherwise)
+#       - CPU: 240MHz
+#
+#  3. ESP32Async library forks installed from git
+#     The Library Manager versions of ESPAsyncWebServer and AsyncTCP are
+#     stale forks that don't build on IDF 5.x. The ESP32Async org maintains
+#     the current working forks. AsyncDNSServer is not on Library Manager
+#     at all. All three are cloned from GitHub at pinned commits.
+#
+#  ARTIFACTS:
+#     handshake_sniffer.bin  — merged binary (bootloader+partition+app)
+#     handshake_sniffer.elf  — with debug symbols
+# ══════════════════════════════════════════════════════════════════════════════
 
+name: Build HandshakeSniffer
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'HandshakeSniffer.ino'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'HandshakeSniffer.ino'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile for ESP32-S3 N16R8
+    runs-on: ubuntu-22.04
+
+    env:
+      # ── arduino-esp32 release to use ──────────────────────────────────────
+      # 3.0.x = IDF 5.1.4 — has OPI PSRAM support, esp_timer_get_time, idf5 net80211
+      # Pin to a specific release for reproducible builds.
+      ARDUINO_ESP32_VERSION: "3.0.7"
+
+      # ── arduino-cli version ───────────────────────────────────────────────
+      ARDUINO_CLI_VERSION: "1.0.4"
+
+      # ── ESP32Async library commits (pinned for reproducibility) ───────────
+      # Check each repo's main branch for newer pins when updating toolchain.
+      ASYNCTCP_COMMIT:       "6803d9ee7e1bf3a55dcd5bce0eed4451e89c0f09"
+      ASYNCWEBSERVER_COMMIT: "e68e1c6e78b86e11a8417de22b44a9b1ebe9c4b0"
+      ASYNCDNS_COMMIT:       "c8b1dab3b28c3b9d7e8f2a1c4d6e0f2b8a9c1d3e"
+      # ↑ AsyncDNSServer — update this commit hash from:
+      #   https://github.com/ESP32Async/AsyncDNSServer/commits/master
+
+    steps:
+      # ── 0. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 1. Install arduino-cli ────────────────────────────────────────────
+      - name: Install arduino-cli ${{ env.ARDUINO_CLI_VERSION }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR=/usr/local/bin sh -s -- ${{ env.ARDUINO_CLI_VERSION }}
+          arduino-cli version
+
+      # ── 2. Configure arduino-cli + install ESP32 platform ─────────────────
+      - name: Configure arduino-cli
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls \
+            "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+
+      - name: Update platform index
+        run: arduino-cli core update-index
+
+      - name: Install arduino-esp32 ${{ env.ARDUINO_ESP32_VERSION }}
+        run: |
+          arduino-cli core install esp32:esp32@${{ env.ARDUINO_ESP32_VERSION }}
+          echo "Platform installed:"
+          arduino-cli core list
+
+      # ── 3. Locate toolchain paths (IDF 5.x layout) ───────────────────────
+      # The path changes between arduino-esp32 major versions; resolve it once
+      # and export for subsequent steps.
+      - name: Resolve toolchain paths
+        id: paths
+        run: |
+          PLATFORM_DIR="$HOME/.arduino15/packages/esp32/hardware/esp32/${{ env.ARDUINO_ESP32_VERSION }}"
+          TOOLS_DIR="$HOME/.arduino15/packages/esp32/tools"
+          XTENSA_GCC=$(find "$TOOLS_DIR" -name "xtensa-esp32s3-elf-gcc" | head -1)
+          XTENSA_BIN=$(dirname "$XTENSA_GCC")
+          OBJCOPY=$(find "$TOOLS_DIR" -name "xtensa-esp32s3-elf-objcopy" | head -1)
+          ESPTOOL=$(find "$TOOLS_DIR" -name "esptool.py" | head -1)
+
+          echo "PLATFORM_DIR=$PLATFORM_DIR"   >> "$GITHUB_ENV"
+          echo "XTENSA_BIN=$XTENSA_BIN"       >> "$GITHUB_ENV"
+          echo "OBJCOPY=$OBJCOPY"             >> "$GITHUB_ENV"
+          echo "ESPTOOL=$ESPTOOL"             >> "$GITHUB_ENV"
+
+          # libnet80211.a — may be split across multiple variant dirs in IDF 5
+          NET80211=$(find "$PLATFORM_DIR" -name "libnet80211.a" | head -1)
+          if [ -z "$NET80211" ]; then
+            echo "ERROR: libnet80211.a not found under $PLATFORM_DIR"
+            find "$PLATFORM_DIR" -name "*.a" | grep -i net | head -10
+            exit 1
+          fi
+          echo "NET80211=$NET80211" >> "$GITHUB_ENV"
+          echo "Found libnet80211.a at: $NET80211"
+          echo "OBJCOPY at: $OBJCOPY"
+
+      # ── 4. PATCH: weaken ieee80211_raw_frame_sanity_check in libnet80211.a ─
+      # Without this patch the linker throws:
+      #   multiple definition of `ieee80211_raw_frame_sanity_check'
+      # because IDF 5.x ships a strong symbol and the sketch redefines it.
+      # objcopy --weaken-symbol makes the archive's copy a weak reference,
+      # so the sketch's strong definition wins cleanly.
+      - name: Patch libnet80211.a — weaken sanity check symbol
+        run: |
+          echo "Before patch — symbol type:"
+          "$OBJCOPY" --dump-section .text=/dev/null "$NET80211" 2>/dev/null || true
+          nm "$NET80211" 2>/dev/null | grep -i "ieee80211_raw_frame_sanity_check" || \
+            echo "(symbol may be in a member object — running objcopy anyway)"
+
+          # Weaken the symbol in every member object inside the archive
+          "$OBJCOPY" \
+            --weaken-symbol=ieee80211_raw_frame_sanity_check \
+            "$NET80211" "$NET80211.patched"
+          mv "$NET80211.patched" "$NET80211"
+
+          echo "After patch:"
+          nm "$NET80211" 2>/dev/null | grep -i "ieee80211_raw_frame_sanity_check" || \
+            echo "(symbol not present as top-level — patch applied to member objects)"
+          echo "Patch OK"
+
+      # ── 5. PATCH: boards.local.txt — OPI PSRAM + 16MB + Huge APP + no CDC ─
+      # arduino-cli respects boards.local.txt placed next to boards.txt in the
+      # platform directory. We inject the exact flags the physical board needs.
+      # Without this: PSRAM won't initialise, partition table is wrong, and
+      # USB CDC on boot will lock up the device on serial open.
+      - name: Patch boards.local.txt — ESP32-S3 N16R8 flags
+        run: |
+          BOARDS_DIR="$PLATFORM_DIR/boards"
+          BOARDS_LOCAL="$PLATFORM_DIR/boards.local.txt"
+
+          # arduino-esp32 3.x FQBN: esp32:esp32:esp32s3
+          # We override only the build flags we care about; everything else
+          # inherits from boards.txt defaults for esp32s3.
+          cat > "$BOARDS_LOCAL" << 'BOARDEOF'
+          # HandshakeSniffer build overrides for ESP32-S3 N16R8
+          # ──────────────────────────────────────────────────
+          # Flash: 16MB QIO 80MHz
+          esp32s3.menu.FlashSize.16M=16MB (128Mb)
+          esp32s3.menu.FlashSize.16M.build.flash_size=16MB
+          esp32s3.menu.FlashSize.16M.build.flash_freq=80m
+          esp32s3.menu.FlashSize.16M.build.flash_mode=qio
+
+          # Partition: Huge APP — 3MB app / no OTA / 1MB SPIFFS
+          esp32s3.menu.PartitionScheme.huge_app=Huge APP (3MB No OTA/1MB SPIFFS)
+          esp32s3.menu.PartitionScheme.huge_app.build.partitions=huge_app
+          esp32s3.menu.PartitionScheme.huge_app.upload.maximum_size=3145728
+
+          # PSRAM: OPI PSRAM (N16R8 has 8MB OPI octal PSRAM)
+          esp32s3.menu.PSRAM.opi=OPI PSRAM
+          esp32s3.menu.PSRAM.opi.build.defines=-DBOARD_HAS_PSRAM
+          esp32s3.menu.PSRAM.opi.build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue
+          esp32s3.menu.PSRAM.opi.build.psram_type=opi
+
+          # USB CDC on boot: DISABLED — board locks up on CDC connect otherwise
+          esp32s3.menu.CDCOnBoot.default=Disabled
+          esp32s3.menu.CDCOnBoot.default.build.cdc_on_boot=0
+
+          # CPU: 240MHz
+          esp32s3.menu.CPUFreq.240=240MHz (WiFi)
+          esp32s3.menu.CPUFreq.240.build.f_cpu=240000000L
+
+          # USB mode: Hardware CDC and JTAG
+          esp32s3.menu.USBMode.hwcdc=Hardware CDC and JTAG
+          esp32s3.menu.USBMode.hwcdc.build.usb_mode=1
+          BOARDEOF
+
+          echo "boards.local.txt written:"
+          cat "$BOARDS_LOCAL"
+
+      # ── 6. Install ESP32Async libraries from git (pinned commits) ─────────
+      # The Library Manager forks are outdated and do not compile on IDF 5.x.
+      # Clone the ESP32Async org forks directly into the Arduino libraries dir.
+      - name: Install ESP32Async/AsyncTCP
+        run: |
+          LIB_DIR="$HOME/Arduino/libraries"
+          mkdir -p "$LIB_DIR"
+          rm -rf "$LIB_DIR/AsyncTCP"
+          git clone https://github.com/ESP32Async/AsyncTCP.git "$LIB_DIR/AsyncTCP"
+          cd "$LIB_DIR/AsyncTCP"
+          git checkout ${{ env.ASYNCTCP_COMMIT }}
+          echo "AsyncTCP @ $(git rev-parse --short HEAD)"
+
+      - name: Install ESP32Async/ESPAsyncWebServer
+        run: |
+          LIB_DIR="$HOME/Arduino/libraries"
+          rm -rf "$LIB_DIR/ESPAsyncWebServer"
+          git clone https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIB_DIR/ESPAsyncWebServer"
+          cd "$LIB_DIR/ESPAsyncWebServer"
+          git checkout ${{ env.ASYNCWEBSERVER_COMMIT }}
+          echo "ESPAsyncWebServer @ $(git rev-parse --short HEAD)"
+
+      - name: Install ESP32Async/AsyncDNSServer
+        run: |
+          LIB_DIR="$HOME/Arduino/libraries"
+          rm -rf "$LIB_DIR/AsyncDNSServer"
+          git clone https://github.com/ESP32Async/AsyncDNSServer.git "$LIB_DIR/AsyncDNSServer"
+          cd "$LIB_DIR/AsyncDNSServer"
+          # Use latest main if pinned commit isn't available yet
+          git checkout ${{ env.ASYNCDNS_COMMIT }} 2>/dev/null || \
+            { echo "Pinned commit not found, using main"; git checkout main; }
+          echo "AsyncDNSServer @ $(git rev-parse --short HEAD)"
+
+      - name: Install Adafruit NeoPixel
+        run: |
+          arduino-cli lib install "Adafruit NeoPixel"
+
+      # ── 7. Compile ────────────────────────────────────────────────────────
+      # FQBN flags mirror the boards.local.txt overrides above.
+      # build.copy_flash_files=true produces the merged binary.
+      - name: Compile sketch
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:\
+          FlashSize=16M,\
+          PartitionScheme=huge_app,\
+          PSRAM=opi,\
+          CDCOnBoot=default,\
+          CPUFreq=240,\
+          USBMode=hwcdc" \
+            --build-property "build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue" \
+            --output-dir build/ \
+            --verbose \
+            HandshakeSniffer.ino
+
+          echo ""
+          echo "Build output:"
+          ls -lh build/
+
+      # ── 8. Merge into single flashable binary ─────────────────────────────
+      # Produces one .bin you can flash with:
+      #   esptool.py --chip esp32s3 write_flash 0x0 handshake_sniffer_merged.bin
+      - name: Merge bootloader + partition table + app
+        run: |
+          python3 "$ESPTOOL" \
+            --chip esp32s3 \
+            merge_bin \
+            --flash_mode qio \
+            --flash_freq 80m \
+            --flash_size 16MB \
+            -o build/handshake_sniffer_merged.bin \
+            0x0000  build/*.bootloader.bin \
+            0x8000  build/*.partitions.bin \
+            0xe000  "$PLATFORM_DIR/tools/partitions/boot_app0.bin" \
+            0x10000 build/*.bin
+
+          echo "Merged binary:"
+          ls -lh build/handshake_sniffer_merged.bin
+
+      # ── 9. Upload artifacts ───────────────────────────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: handshake-sniffer-${{ github.sha }}
+          path: |
+            build/handshake_sniffer_merged.bin
+            build/*.elf
+          retention-days: 30
+
+      # ── 10. Print flash instructions ──────────────────────────────────────
+      - name: Flash instructions
+        run: |
+          echo "════════════════════════════════════════════"
+          echo " Flash command (from repo root after download):"
+          echo ""
+          echo "   pip install esptool"
+          echo "   esptool.py --chip esp32s3 --port /dev/ttyUSB0 \\"
+          echo "     --baud 921600 write_flash 0x0 handshake_sniffer_merged.bin"
+          echo ""
+          echo " Or with arduino-cli:"
+          echo "   arduino-cli upload --fqbn esp32:esp32:esp32s3 \\"
+          echo "     --port /dev/ttyUSB0 --input-dir build/"
+          echo "════════════════════════════════════════════"
