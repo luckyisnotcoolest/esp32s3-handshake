@@ -1,33 +1,36 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  HandshakeSniffer — GitHub Actions build
+#  HandshakeSniffer v1.3 — GitHub Actions build
 #  Target : ESP32-S3 N16R8 (OPI PSRAM, 16MB flash)
-#  Toolchain : arduino-cli + arduino-esp32 3.3.5 (IDF 5.3.x)
+#  Toolchain : arduino-cli + arduino-esp32 3.3.5 (IDF 5.5.x)
 #
-#  PATCHES APPLIED:
+#  PATCHES:
 #
 #  1. libnet80211.a — weaken ieee80211_raw_frame_sanity_check
-#     The sketch redefines this symbol to bypass the TX sanity check
-#     (required for esp_wifi_80211_tx raw frame injection / deauth).
-#     IDF 5.x ships a strong definition in libnet80211.a; the linker
-#     rejects a second strong definition in the sketch. We run objcopy
-#     --weaken-symbol on the archive so the sketch's definition wins
-#     at link time without --allow-multiple-definition.
+#     Allows esp_wifi_80211_tx raw frame injection (deauth/disassoc/auth).
+#     Sketch redefines the symbol; objcopy --weaken-symbol makes the
+#     linker prefer the sketch's strong definition over the lib's.
 #
 #  2. board flags — OPI PSRAM + 16MB flash + Huge APP partition
-#     Set via FQBN options passed directly to arduino-cli compile.
 #
-#  3. Libraries installed via git clone (HEAD, no pinned tag — avoids
-#     HTTPS credential prompting on newer CI runners):
+#  3. Libraries installed via git clone (ESP32Async forks — required for
+#     Arduino ESP32 core 3.x; me-no-dev originals broken on core 3.x):
 #       - ESP32Async/AsyncTCP
 #       - ESP32Async/ESPAsyncWebServer
+#       - ESP32Async/AsyncDNSServer   ← REQUIRED (sketch uses AsyncDNSServer.h)
+#         NOTE: This is NOT the same as the built-in DNSServer that ships
+#         with arduino-esp32. The built-in is synchronous; this sketch uses
+#         the async variant. Missing this was the v1.2 compile failure.
 #       - Adafruit NeoPixel (via arduino-cli lib install)
-#     DNSServer is built into arduino-esp32 — no extra lib needed.
+#
+#  Build log reference: esp32:esp-x32@2511 is the toolchain package name
+#  for core 3.3.5. objcopy lives under esp-x32/*/bin/. The find command
+#  searches all subdirs — works regardless of version number in path.
 #
 #  ARTIFACTS:
-#     build/  — .bin, .elf, .map (upload to device with esptool)
+#     build/  — merged.bin (flash at 0x0) + elf + map
 # ══════════════════════════════════════════════════════════════════════════════
 
-name: Build HandshakeSniffer
+name: Build HandshakeSniffer v1.3
 
 on:
   push:
@@ -65,19 +68,31 @@ jobs:
           arduino-cli core list
 
       # ── 4. Install 3rd-party libraries ───────────────────────────────────
-      # git clone --depth 1 (no --branch) clones HEAD of the default branch.
-      # This avoids the HTTPS credential prompt that breaks pinned-tag clones
-      # on newer CI runners. DNSServer ships with arduino-esp32, no install needed.
+      # IMPORTANT: AsyncDNSServer must be from ESP32Async fork, not from
+      # lacamera or any other fork. Only the ESP32Async fork builds cleanly
+      # against arduino-esp32 core 3.x (IDF 5.x API).
       - name: Install libraries
         run: |
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
-          git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git        "$LIBDIR/AsyncTCP"
-          git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
+
+          git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git \
+            "$LIBDIR/AsyncTCP"
+          git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git \
+            "$LIBDIR/ESPAsyncWebServer"
+          # AsyncDNSServer — required for captive portal (AsyncDNSServer.h)
+          # NOT the built-in DNSServer — this sketch uses the async variant
+          git clone --depth 1 https://github.com/ESP32Async/AsyncDNSServer.git \
+            "$LIBDIR/AsyncDNSServer"
+
           arduino-cli lib install "Adafruit NeoPixel"
+
           echo "=== Installed libraries ===" && ls "$LIBDIR"
 
       # ── 5. Locate toolchain + libnet80211.a ──────────────────────────────
+      # Search all tool subdirs — the folder name under /tools/ changed across
+      # core versions (esp-x32 in 3.3.5, may change in later versions).
+      # Using find without a fixed parent folder makes this future-proof.
       - name: Locate toolchain paths
         run: |
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
@@ -86,7 +101,6 @@ jobs:
           OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f | head -1)
           NM=$(find      "$TOOLS" -name "xtensa-esp32s3-elf-nm"      -type f | head -1)
           LIBNET=$(find  "$PKG"   -name "libnet80211.a" -path "*/esp32s3/*" -type f | head -1)
-          # Fallback for layouts that don't separate by variant
           [ -z "$LIBNET" ] && LIBNET=$(find "$PKG" -name "libnet80211.a" -type f | head -1)
 
           echo "OBJCOPY : ${OBJCOPY:-NOT FOUND}"
@@ -101,25 +115,24 @@ jobs:
           echo "LIBNET=$LIBNET"   >> $GITHUB_ENV
 
       # ── 6. Patch libnet80211.a ────────────────────────────────────────────
-      # Weaken ieee80211_raw_frame_sanity_check so the sketch's stub wins at
-      # link time and raw frame TX (deauth/disassoc) reaches the radio.
       - name: Patch libnet80211.a — weaken sanity check symbol
         run: |
-          echo "Before patch:"
-          [ -n "$NM" ] && "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" \
+          echo "=== Before patch ==="
+          [ -n "$NM" ] && "$NM" "$LIBNET" 2>/dev/null \
+            | grep "ieee80211_raw_frame_sanity_check" \
             || echo "(symbol may be in a member object)"
 
           "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check \
             "$LIBNET" "$LIBNET.patched"
           mv "$LIBNET.patched" "$LIBNET"
 
-          echo "After patch:"
-          [ -n "$NM" ] && "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" \
-            || echo "(patch applied to member objects — top-level nm may not show it)"
-          echo "Patch OK"
+          echo "=== After patch ==="
+          [ -n "$NM" ] && "$NM" "$LIBNET" 2>/dev/null \
+            | grep "ieee80211_raw_frame_sanity_check" \
+            || echo "(symbol weakened in member objects)"
+          echo "Patch applied"
 
       # ── 7. Prepare sketch folder ──────────────────────────────────────────
-      # arduino-cli requires a directory named after the .ino file.
       - name: Prepare sketch folder
         run: |
           mkdir -p HandshakeSniffer
@@ -144,17 +157,28 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: handshake-sniffer-${{ github.sha }}
+          name: handshake-sniffer-v1.3-${{ github.sha }}
           path: build/
           retention-days: 30
 
       # ── 10. Flash instructions ────────────────────────────────────────────
       - name: Flash instructions
         run: |
-          echo "════════════════════════════════════════════"
-          echo " Flash command (from repo root after download):"
+          echo "════════════════════════════════════════════════════════"
+          echo " HandshakeSniffer v1.3 — Flash instructions"
           echo ""
-          echo "   pip install esptool"
+          echo " Recommended (single merged image):"
           echo "   esptool.py --chip esp32s3 --port /dev/ttyUSB0 \\"
-          echo "     --baud 921600 write_flash 0x0 handshake_sniffer.bin"
-          echo "════════════════════════════════════════════"
+          echo "     --baud 921600 write_flash \\"
+          echo "     --flash_mode qio --flash_freq 80m --flash_size 16MB \\"
+          echo "     0x0 HandshakeSniffer.ino.merged.bin"
+          echo ""
+          echo " Manual (three parts):"
+          echo "   0x0000  HandshakeSniffer.ino.bootloader.bin"
+          echo "   0x8000  HandshakeSniffer.ino.partitions.bin"
+          echo "   0x10000 HandshakeSniffer.ino.bin"
+          echo ""
+          echo " Android ESP Flasher: use merged.bin at offset 0x0"
+          echo " AP SSID: HandshakeSniffer  Pass: sniff1234"
+          echo " UI: http://192.168.4.1/"
+          echo "════════════════════════════════════════════════════════"
