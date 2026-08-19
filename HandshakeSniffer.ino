@@ -1239,8 +1239,21 @@ void setupServer() {
     if (len <= sizeof(PcapGlobalHdr)) {
       r->send(404,"text/plain","No capture data. Start capture and trigger a handshake first."); return;
     }
-    AsyncWebServerResponse* resp = r->beginResponse_P(
-      200, "application/octet-stream", g_capBuf, len);
+    // beginResponse_P is for PROGMEM/flash only — PSRAM/heap needs beginResponse.
+    // Snapshot the buffer into a local heap copy so the async send can't race
+    // with a concurrent capture that might advance g_capLen mid-send.
+    uint8_t* snap = (uint8_t*)malloc(len);
+    if (!snap) { r->send(500,"text/plain","OOM"); return; }
+    memcpy(snap, g_capBuf, len);
+    AsyncWebServerResponse* resp = r->beginResponse(
+      200, "application/octet-stream",
+      [snap, len](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+        size_t remaining = len - index;
+        size_t chunk = remaining < maxLen ? remaining : maxLen;
+        if (chunk == 0) { free(snap); return 0; }
+        memcpy(buf, snap + index, chunk);
+        return chunk;
+      }, len);
     resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.pcap\"");
     r->send(resp);
     logEvent("PCAP served: %u bytes", (unsigned)len);
@@ -1327,7 +1340,7 @@ void setup() {
   Serial0.begin(115200);
   delay(200);
   Serial0.println("\n==========================================");
-  Serial0.println("  HandshakeSniffer v1.1 — ESP32-S3");
+  Serial0.println("  HandshakeSniffer v1.2 — ESP32-S3");
   Serial0.println("==========================================\n");
 
   led.begin(); led.setBrightness(60); led.clear(); led.show();
