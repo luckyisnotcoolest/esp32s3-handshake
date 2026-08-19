@@ -28,6 +28,7 @@ jobs:
       # ── 3. Install ESP32 Arduino core 3.3.5 ──────────────────────────────
       - name: Install ESP32 core
         run: |
+          set -euo pipefail
           arduino-cli config init
           arduino-cli core update-index \
             --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
@@ -36,45 +37,47 @@ jobs:
           arduino-cli core list
 
       # ── 4. Install 3rd-party libraries ───────────────────────────────────
-      # CRITICAL: All async libs MUST be ESP32Async forks for core 3.x compat.
-      # me-no-dev originals are broken on IDF 5.x / Arduino ESP32 3.x.
-      # AsyncDNSServer is NOT the built-in DNSServer - this sketch uses async variant.
+      # CRITICAL: AsyncDNSServer MUST be ESP32Async fork. 
+      # Built-in DNSServer is sync; sketch requires async variant.
+      # Missing this caused v1.2 compile failure.
       - name: Install libraries
         run: |
           set -euo pipefail
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
-          
-          echo "Installing ESP32Async forks..."
+
+          echo "Installing ESP32Async forks (core 3.x compatible)..."
           git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git "$LIBDIR/AsyncTCP"
           git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
           git clone --depth 1 https://github.com/ESP32Async/AsyncDNSServer.git "$LIBDIR/AsyncDNSServer"
-          
+
           echo "Installing Adafruit NeoPixel..."
           arduino-cli lib install "Adafruit NeoPixel"
-          
+
           echo "=== Installed libraries ==="
           ls -la "$LIBDIR"
 
       # ── 5. Locate toolchain + libnet80211.a ──────────────────────────────
+      # Robust discovery from ArsWebUI — handles path changes across core versions
       - name: Locate toolchain paths
         run: |
           set -euo pipefail
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
           PKG="$HOME/.arduino15/packages/esp32"
-          
+
           OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f 2>/dev/null | head -1)
           NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm" -type f 2>/dev/null | head -1)
           LIBNET=$(find "$PKG" -name "libnet80211.a" -path "*/esp32s3/*" -type f 2>/dev/null | head -1)
-          
+
+          # Fallback search if esp32s3-specific path not found
           if [ -z "$LIBNET" ]; then
             LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | head -1)
           fi
-          
+
           echo "OBJCOPY : ${OBJCOPY:-NOT FOUND}"
           echo "NM      : ${NM:-NOT FOUND}"
           echo "LIBNET  : ${LIBNET:-NOT FOUND}"
-          
+
           if [ -z "$OBJCOPY" ]; then
             echo "FATAL: xtensa-esp32s3-elf-objcopy not found"
             exit 1
@@ -83,37 +86,50 @@ jobs:
             echo "FATAL: libnet80211.a not found for esp32s3"
             exit 1
           fi
-          
+
           echo "OBJCOPY=$OBJCOPY" >> "$GITHUB_ENV"
           echo "NM=$NM" >> "$GITHUB_ENV"
           echo "LIBNET=$LIBNET" >> "$GITHUB_ENV"
 
-      # ── 6. Patch libnet80211.a ────────────────────────────────────────────
+      # ── 6. Inspect & Patch libnet80211.a ─────────────────────────────────
       # Weakens ieee80211_raw_frame_sanity_check so sketch stub wins at link time.
       # Required for raw 802.11 frame injection (deauth/disassoc/auth frames).
-      - name: Patch libnet80211.a
+      - name: Inspect and patch libnet80211.a
         run: |
           set -euo pipefail
-          echo "=== Before patch ==="
-          if [ -n "$NM" ]; then
-            "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
-          fi
           
-          "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check \
-            "$LIBNET" "$LIBNET.patched"
-          mv "$LIBNET.patched" "$LIBNET"
-          
-          echo "=== After patch ==="
+          # Check symbol status before patching
+          SANITY_GLOBAL=0
           if [ -n "$NM" ]; then
-            RESULT=$("$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true)
-            echo "$RESULT"
-            if echo "$RESULT" | grep -qE " [Tt] "; then
-              echo "WARNING: Symbol still appears GLOBAL after patch"
+            if "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" | grep -qE " [Tt] "; then
+              SANITY_GLOBAL=1
+              echo "Symbol is GLOBAL/TEXT — will weaken"
+            elif "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" | grep -qE " [Ww] "; then
+              echo "Symbol already WEAK — no patch needed"
             else
-              echo "VERIFIED: Symbol successfully weakened"
+              echo "Symbol not found or unknown binding — sketch stub handles it"
             fi
           fi
-          echo "Patch applied successfully"
+
+          if [ "$SANITY_GLOBAL" = "1" ]; then
+            echo "Backing up original library..."
+            cp "$LIBNET" "${LIBNET}.original.bak"
+            
+            echo "Weakening ieee80211_raw_frame_sanity_check..."
+            "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check "$LIBNET" "$LIBNET.patched"
+            mv "$LIBNET.patched" "$LIBNET"
+            
+            # Verify patch
+            if [ -n "$NM" ]; then
+              RESULT=$("$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true)
+              echo "After patch: $RESULT"
+              if echo "$RESULT" | grep -qE " [Tt] "; then
+                echo "WARNING: Symbol still appears GLOBAL after patch"
+              else
+                echo "VERIFIED: Symbol successfully weakened"
+              fi
+            fi
+          fi
 
       # ── 7. Prepare sketch folder ──────────────────────────────────────────
       - name: Prepare sketch folder
@@ -139,14 +155,14 @@ FlashMode=qio,\
 FlashSize=16M,\
 DebugLevel=none,\
 UploadSpeed=921600"
-          
+
           echo "FQBN: $FQBN"
           arduino-cli compile \
             --fqbn "$FQBN" \
             --output-dir build \
             --verbose \
             HandshakeSniffer
-          
+
           echo "=== Build outputs ==="
           ls -lh build/
 
@@ -159,26 +175,27 @@ UploadSpeed=921600"
           retention-days: 30
 
       # ── 10. Flash instructions ────────────────────────────────────────────
+      # FIXED: Single-quoted heredoc prevents YAML quote parsing errors
       - name: Flash instructions
         run: |
-          cat << 'EOF'
+          cat << 'FLASHEOF'
           ════════════════════════════════════════════════════════
            HandshakeSniffer v1.3 - Flash Instructions
           ════════════════════════════════════════════════════════
-          
+
           Recommended (single merged image):
             esptool.py --chip esp32s3 --port /dev/ttyUSB0 \
               --baud 921600 write_flash \
               --flash_mode qio --flash_freq 80m --flash_size 16MB \
               0x0 HandshakeSniffer.ino.merged.bin
-          
+
           Manual (three parts):
             0x0000  HandshakeSniffer.ino.bootloader.bin
             0x8000  HandshakeSniffer.ino.partitions.bin
             0x10000 HandshakeSniffer.ino.bin
-          
+
           Android ESP Flasher: use merged.bin at offset 0x0
           AP SSID: HandshakeSniffer  Pass: sniff1234
           UI: http://192.168.4.1/
           ════════════════════════════════════════════════════════
-          EOF
+          FLASHEOF
