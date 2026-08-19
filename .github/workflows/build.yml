@@ -188,37 +188,37 @@ jobs:
           # We override only the build flags we care about; everything else
           # inherits from boards.txt defaults for esp32s3.
           cat > "$BOARDS_LOCAL" << 'BOARDEOF'
-          # HandshakeSniffer build overrides for ESP32-S3 N16R8
-          # ──────────────────────────────────────────────────
-          # Flash: 16MB QIO 80MHz
-          esp32s3.menu.FlashSize.16M=16MB (128Mb)
-          esp32s3.menu.FlashSize.16M.build.flash_size=16MB
-          esp32s3.menu.FlashSize.16M.build.flash_freq=80m
-          esp32s3.menu.FlashSize.16M.build.flash_mode=qio
+# HandshakeSniffer build overrides for ESP32-S3 N16R8
+# ──────────────────────────────────────────────────
+# Flash: 16MB QIO 80MHz
+esp32s3.menu.FlashSize.16M=16MB (128Mb)
+esp32s3.menu.FlashSize.16M.build.flash_size=16MB
+esp32s3.menu.FlashSize.16M.build.flash_freq=80m
+esp32s3.menu.FlashSize.16M.build.flash_mode=qio
 
-          # Partition: Huge APP — 3MB app / no OTA / 1MB SPIFFS
-          esp32s3.menu.PartitionScheme.huge_app=Huge APP (3MB No OTA/1MB SPIFFS)
-          esp32s3.menu.PartitionScheme.huge_app.build.partitions=huge_app
-          esp32s3.menu.PartitionScheme.huge_app.upload.maximum_size=3145728
+# Partition: Huge APP — 3MB app / no OTA / 1MB SPIFFS
+esp32s3.menu.PartitionScheme.huge_app=Huge APP (3MB No OTA/1MB SPIFFS)
+esp32s3.menu.PartitionScheme.huge_app.build.partitions=huge_app
+esp32s3.menu.PartitionScheme.huge_app.upload.maximum_size=3145728
 
-          # PSRAM: OPI PSRAM (N16R8 has 8MB OPI octal PSRAM)
-          esp32s3.menu.PSRAM.opi=OPI PSRAM
-          esp32s3.menu.PSRAM.opi.build.defines=-DBOARD_HAS_PSRAM
-          esp32s3.menu.PSRAM.opi.build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue
-          esp32s3.menu.PSRAM.opi.build.psram_type=opi
+# PSRAM: OPI PSRAM (N16R8 has 8MB OPI octal PSRAM)
+esp32s3.menu.PSRAM.opi=OPI PSRAM
+esp32s3.menu.PSRAM.opi.build.defines=-DBOARD_HAS_PSRAM
+esp32s3.menu.PSRAM.opi.build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue
+esp32s3.menu.PSRAM.opi.build.psram_type=opi
 
-          # USB CDC on boot: DISABLED — board locks up on CDC connect otherwise
-          esp32s3.menu.CDCOnBoot.default=Disabled
-          esp32s3.menu.CDCOnBoot.default.build.cdc_on_boot=0
+# USB CDC on boot: DISABLED — board locks up on CDC connect otherwise
+esp32s3.menu.CDCOnBoot.default=Disabled
+esp32s3.menu.CDCOnBoot.default.build.cdc_on_boot=0
 
-          # CPU: 240MHz
-          esp32s3.menu.CPUFreq.240=240MHz (WiFi)
-          esp32s3.menu.CPUFreq.240.build.f_cpu=240000000L
+# CPU: 240MHz
+esp32s3.menu.CPUFreq.240=240MHz (WiFi)
+esp32s3.menu.CPUFreq.240.build.f_cpu=240000000L
 
-          # USB mode: Hardware CDC and JTAG
-          esp32s3.menu.USBMode.hwcdc=Hardware CDC and JTAG
-          esp32s3.menu.USBMode.hwcdc.build.usb_mode=1
-          BOARDEOF
+# USB mode: Hardware CDC and JTAG
+esp32s3.menu.USBMode.hwcdc=Hardware CDC and JTAG
+esp32s3.menu.USBMode.hwcdc.build.usb_mode=1
+BOARDEOF
 
           echo "boards.local.txt written:"
           cat "$BOARDS_LOCAL"
@@ -260,15 +260,21 @@ jobs:
             echo "Falling back to ESPAsyncDNSServer from GitHub..."
 
             rm -rf "$LIB_DIR/ESPAsyncDNSServer"
-            git clone --depth=1               https://github.com/devyte/ESPAsyncDNSServer.git               "$LIB_DIR/ESPAsyncDNSServer"
+            git clone --depth=1 \
+              https://github.com/devyte/ESPAsyncDNSServer.git \
+              "$LIB_DIR/ESPAsyncDNSServer"
 
             echo "ESPAsyncDNSServer installed from GitHub:"
             git -C "$LIB_DIR/ESPAsyncDNSServer" rev-parse --short HEAD
 
-            # Also expose the library under the name expected by sketches
-            # that use AsyncDNSServer_ESP32.h.
+            # Expose the library under both names the sketch may include:
+            #   <AsyncDNSServer_ESP32.h>  — explicit include style
+            #   <AsyncDNSServer.h>        — what HandshakeSniffer.ino uses
             if [ -f "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" ]; then
-              cp "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h"                  "$LIB_DIR/ESPAsyncDNSServer/AsyncDNSServer_ESP32.h"
+              cp "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" \
+                 "$LIB_DIR/ESPAsyncDNSServer/AsyncDNSServer_ESP32.h"
+              cp "$LIB_DIR/ESPAsyncDNSServer/ESPAsyncDNSServer.h" \
+                 "$LIB_DIR/ESPAsyncDNSServer/AsyncDNSServer.h"
             fi
           fi
 
@@ -277,10 +283,15 @@ jobs:
           arduino-cli lib install "Adafruit NeoPixel"
 
       # ── 7. Compile ────────────────────────────────────────────────────────
-      # FQBN flags mirror the boards.local.txt overrides above.
-      # build.copy_flash_files=true produces the merged binary.
+      # arduino-cli requires the sketch to live in a directory whose name
+      # matches the .ino filename. The repo root is 'esp32s3-handshake', which
+      # does not match 'HandshakeSniffer', so we wrap the file before compiling.
+      # Passing HandshakeSniffer/ (the directory) is the correct form.
       - name: Compile sketch
         run: |
+          mkdir -p HandshakeSniffer
+          cp HandshakeSniffer.ino HandshakeSniffer/
+
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:\
           FlashSize=16M,\
@@ -292,7 +303,7 @@ jobs:
             --build-property "build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue" \
             --output-dir build/ \
             --verbose \
-            HandshakeSniffer.ino
+            HandshakeSniffer/
 
           echo ""
           echo "Build output:"
