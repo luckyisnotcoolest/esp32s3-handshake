@@ -1,4 +1,4 @@
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 #  HandshakeSniffer v1.3 — GitHub Actions build
 #  Target : ESP32-S3 N16R8 (OPI PSRAM, 16MB flash)
 #  Toolchain : arduino-cli + arduino-esp32 3.3.5 (IDF 5.5.x)
@@ -28,7 +28,7 @@
 #
 #  ARTIFACTS:
 #     build/  — merged.bin (flash at 0x0) + elf + map
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 
 name: Build HandshakeSniffer v1.3
 
@@ -76,14 +76,29 @@ jobs:
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
 
-          git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git \
-            "$LIBDIR/AsyncTCP"
-          git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git \
-            "$LIBDIR/ESPAsyncWebServer"
+          # Retry function for git clone operations (handles transient network failures)
+          retry_git_clone() {
+            local url="$1"
+            local dest="$2"
+            local retries=3
+            local count=0
+            until git clone --depth 1 "$url" "$dest"; do
+              count=$((count + 1))
+              if [ $count -lt $retries ]; then
+                echo "Clone failed. Retrying in 5 seconds... (attempt $count/$retries)"
+                sleep 5
+              else
+                echo "FATAL: Failed to clone after $retries attempts"
+                return 1
+              fi
+            done
+          }
+
+          retry_git_clone "https://github.com/ESP32Async/AsyncTCP.git" "$LIBDIR/AsyncTCP"
+          retry_git_clone "https://github.com/ESP32Async/ESPAsyncWebServer.git" "$LIBDIR/ESPAsyncWebServer"
           # AsyncDNSServer — required for captive portal (AsyncDNSServer.h)
           # NOT the built-in DNSServer — this sketch uses the async variant
-          git clone --depth 1 https://github.com/ESP32Async/AsyncDNSServer.git \
-            "$LIBDIR/AsyncDNSServer"
+          retry_git_clone "https://github.com/ESP32Async/AsyncDNSServer.git" "$LIBDIR/AsyncDNSServer"
 
           arduino-cli lib install "Adafruit NeoPixel"
 
