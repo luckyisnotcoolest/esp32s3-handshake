@@ -115,15 +115,35 @@ jobs:
           echo "OBJCOPY=$OBJCOPY"             >> "$GITHUB_ENV"
           echo "ESPTOOL=$ESPTOOL"             >> "$GITHUB_ENV"
 
-          # libnet80211.a — may be split across multiple variant dirs in IDF 5
-          NET80211=$(find "$PLATFORM_DIR" -name "libnet80211.a" | head -1)
+          # libnet80211.a — in arduino-esp32 3.x (IDF 5) the prebuilt static libs
+          # live under the esp32-arduino-libs TOOL package, not under hardware/.
+          # Path pattern: .arduino15/packages/esp32/tools/esp32-arduino-libs/<ver>/esp32s3/lib/libnet80211.a
+          # Search the whole packages tree; -name is specific enough to be fast.
+          PACKAGES_DIR="$HOME/.arduino15/packages/esp32"
+          NET80211=$(find "$PACKAGES_DIR" -name "libnet80211.a" -path "*/esp32s3/*" | head -1)
+          # Fallback: some builds put variant-less copy at top of libs dir
           if [ -z "$NET80211" ]; then
-            echo "ERROR: libnet80211.a not found under $PLATFORM_DIR"
-            find "$PLATFORM_DIR" -name "*.a" | grep -i net | head -10
+            NET80211=$(find "$PACKAGES_DIR" -name "libnet80211.a" | head -1)
+          fi
+          if [ -z "$NET80211" ]; then
+            echo "ERROR: libnet80211.a not found under $PACKAGES_DIR"
+            echo "--- All .a files matching *net* ---"
+            find "$PACKAGES_DIR" -name "*.a" | grep -i net | head -20
+            echo "--- esp32-arduino-libs tool contents ---"
+            find "$PACKAGES_DIR/tools/esp32-arduino-libs" -maxdepth 3 -type d 2>/dev/null | head -20
             exit 1
           fi
           echo "NET80211=$NET80211" >> "$GITHUB_ENV"
           echo "Found libnet80211.a at: $NET80211"
+
+          # boot_app0.bin — also lives in esp32-arduino-libs tool in 3.x
+          BOOT_APP0=$(find "$PACKAGES_DIR" -name "boot_app0.bin" | head -1)
+          if [ -z "$BOOT_APP0" ]; then
+            # Older layout fallback
+            BOOT_APP0="$PLATFORM_DIR/tools/partitions/boot_app0.bin"
+          fi
+          echo "BOOT_APP0=$BOOT_APP0" >> "$GITHUB_ENV"
+          echo "Found boot_app0.bin at: $BOOT_APP0"
           echo "OBJCOPY at: $OBJCOPY"
 
       # ── 4. PATCH: weaken ieee80211_raw_frame_sanity_check in libnet80211.a ─
@@ -263,6 +283,22 @@ jobs:
       #   esptool.py --chip esp32s3 write_flash 0x0 handshake_sniffer_merged.bin
       - name: Merge bootloader + partition table + app
         run: |
+          # arduino-cli names outputs <sketch>.<suffix> — resolve explicitly
+          # to avoid glob matching the merged output itself on re-runs.
+          BOOTLOADER=$(ls build/*.bootloader.bin 2>/dev/null | head -1)
+          PARTITIONS=$(ls build/*.partitions.bin 2>/dev/null | head -1)
+          # The app .bin is the one that is NOT a bootloader/partitions file
+          APP_BIN=$(ls build/*.bin 2>/dev/null \
+            | grep -v '\.bootloader\.' \
+            | grep -v '\.partitions\.' \
+            | grep -v 'merged' \
+            | head -1)
+
+          echo "Bootloader : $BOOTLOADER"
+          echo "Partitions : $PARTITIONS"
+          echo "App binary : $APP_BIN"
+          echo "boot_app0  : $BOOT_APP0"
+
           python3 "$ESPTOOL" \
             --chip esp32s3 \
             merge_bin \
@@ -270,10 +306,10 @@ jobs:
             --flash_freq 80m \
             --flash_size 16MB \
             -o build/handshake_sniffer_merged.bin \
-            0x0000  build/*.bootloader.bin \
-            0x8000  build/*.partitions.bin \
-            0xe000  "$PLATFORM_DIR/tools/partitions/boot_app0.bin" \
-            0x10000 build/*.bin
+            0x0000  "$BOOTLOADER" \
+            0x8000  "$PARTITIONS" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$APP_BIN"
 
           echo "Merged binary:"
           ls -lh build/handshake_sniffer_merged.bin
