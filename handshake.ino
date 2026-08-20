@@ -1392,9 +1392,9 @@ void setupServer() {
   // Returning a 302 redirect tells the OS "captive portal detected" →
   // OS shows the "Sign in to network" popup/notification automatically.
   //
-  // Android /generate_204 is the exception: 204 = captive portal signal
-  // (Android specifically uses "no content" as the captive portal trigger,
-  //  unlike every other OS which uses redirect detection).
+  // ALL probes → 302 redirect to http://192.168.4.1/
+  // This includes /generate_204 — returning 204 tells Android "internet confirmed"
+  // which produces "limited connectivity" warning NOT a Sign in popup.
   //
   // Platform → probe URL → our response
   // iOS 14+    /hotspot-detect.html         → 302 redirect
@@ -1402,8 +1402,8 @@ void setupServer() {
   // iOS 16+    /bag                         → 302 redirect
   // macOS      /hotspot-detect.html         → 302 redirect
   // macOS      /library/test/success.html   → 302 redirect
-  // Android    /generate_204                → 204 (triggers notification)
-  // Android    /gen_204                     → 204
+  // Android    /generate_204                → 302 redirect (triggers Sign in popup)
+  // Android    /gen_204                     → 302 redirect
   // Android 7+ /connectivity-check.html     → 302 redirect
   // Windows    /ncsi.txt                    → 302 redirect
   // Windows    /connecttest.txt             → 302 redirect
@@ -1422,12 +1422,17 @@ void setupServer() {
     r->redirect("http://192.168.4.1/");
   });
 
-  // Android — 204 is the correct captive portal signal on Android
+  // Android — probe hits /generate_204 expecting 204 = "internet works"
+  // Returning 204 tells Android "confirmed internet" → it notices real
+  // internet doesn't work → falls back to generic "limited connectivity"
+  // warning instead of showing the "Sign in to network" popup.
+  // Returning 302 redirect = "captive portal detected" → Android shows
+  // the proper "Sign in to [SSID]" notification that auto-opens a browser.
   server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(204, "text/plain", "");
+    r->redirect("http://192.168.4.1/");
   });
   server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(204, "text/plain", "");
+    r->redirect("http://192.168.4.1/");
   });
   // Android 7+ Chromium check
   server.on("/connectivity-check.html", HTTP_GET, [](AsyncWebServerRequest* r) {
