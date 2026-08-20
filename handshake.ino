@@ -870,51 +870,78 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>HandshakeSniffer v1.3</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh}
-header{background:#161b22;border-bottom:1px solid #30363d;padding:14px 20px;display:flex;align-items:center;gap:12px}
-header h1{font-size:1.2rem;font-weight:600;color:#58a6ff}
-header .sub{font-size:0.78rem;color:#8b949e}
-.badge{background:#388bfd22;color:#58a6ff;border:1px solid #388bfd55;border-radius:12px;padding:2px 10px;font-size:0.72rem}
-main{max-width:1000px;margin:0 auto;padding:18px 12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:16px;overflow:hidden}
-.card-head{padding:12px 16px;background:#1c2128;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between}
-.card-head h2{font-size:0.95rem;font-weight:600;color:#c9d1d9}
-.card-body{padding:14px 16px}
-button{border:none;border-radius:6px;padding:6px 14px;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh;-webkit-text-size-adjust:100%}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+header h1{font-size:1.1rem;font-weight:600;color:#58a6ff;white-space:nowrap}
+header .sub{font-size:0.72rem;color:#8b949e;margin-top:2px}
+.badge{background:#388bfd22;color:#58a6ff;border:1px solid #388bfd55;border-radius:12px;padding:3px 12px;font-size:0.72rem;white-space:nowrap;flex-shrink:0}
+main{max-width:1000px;margin:0 auto;padding:14px 10px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:14px;overflow:hidden}
+.card-head{padding:10px 14px;background:#1c2128;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.card-head h2{font-size:0.92rem;font-weight:600;color:#c9d1d9}
+.card-body{padding:12px 14px}
+/* ── BUTTONS — min 44px tall on mobile for touch targets ── */
+button{border:none;border-radius:6px;padding:8px 14px;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s;min-height:36px;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 button:hover{opacity:.85}
+button:active{opacity:.7}
+button:disabled{opacity:.4;cursor:default}
 .btn-primary{background:#238636;color:#fff}
 .btn-danger{background:#da3633;color:#fff}
 .btn-warn{background:#9e6a03;color:#fff}
-.btn-sel{background:#0d419d;color:#fff;padding:4px 10px;font-size:0.75rem}
+.btn-sel{background:#0d419d;color:#fff;padding:5px 11px;font-size:0.75rem;min-height:32px}
 .btn-dl{background:#1f6feb;color:#fff}
-.btn-sm{padding:4px 10px;font-size:0.75rem}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{background:#0d1117;color:#8b949e;font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d}
-td{padding:7px 10px;border-bottom:1px solid #21262d;vertical-align:middle}
+.btn-sm{padding:5px 11px;font-size:0.75rem;min-height:32px}
+.row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+/* ── SCAN TABLE — horizontal scroll on mobile ── */
+.tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;overflow-y:hidden;max-height:340px;overflow-y:auto}
+.tbl-scroll::-webkit-scrollbar{height:4px;width:4px}
+.tbl-scroll::-webkit-scrollbar-track{background:#0d1117}
+.tbl-scroll::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
+table{width:100%;min-width:520px;border-collapse:collapse;font-size:0.82rem}
+thead{position:sticky;top:0;z-index:1}
+th{background:#0d1117;color:#8b949e;font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid #21262d;vertical-align:middle;white-space:nowrap}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#1c2128}
-.status-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;font-size:0.82rem}
-.s-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:6px}
-.s-kv{display:flex;flex-direction:column;min-width:80px}
-.s-k{font-size:0.7rem;color:#8b949e;margin-bottom:2px}
-.s-v{font-size:0.9rem;font-weight:600}
+/* SSID col can wrap */
+td:nth-child(2){white-space:normal;word-break:break-all;min-width:80px}
+.status-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 12px;font-size:0.82rem}
+.s-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.s-kv{display:flex;flex-direction:column;min-width:72px}
+.s-k{font-size:0.68rem;color:#8b949e;margin-bottom:2px;white-space:nowrap}
+.s-v{font-size:0.88rem;font-weight:600}
 .ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}.na{color:#8b949e}
 .log-box{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px 10px;
-  height:140px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#8b949e}
-.log-box p{padding:1px 0;border-bottom:1px solid #21262d22}
+  height:130px;overflow-y:auto;font-family:monospace;font-size:0.76rem;color:#8b949e;
+  -webkit-overflow-scrolling:touch}
+.log-box p{padding:1px 0;border-bottom:1px solid #21262d22;word-break:break-all}
 .log-box p:last-child{border:none}
 .ts{color:#388bfd;margin-right:6px}
-.target-info{background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:0.82rem;color:#c9d1d9}
-.mono{font-family:monospace;font-size:0.78rem}
+.target-info{background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:0.82rem;color:#c9d1d9;word-break:break-all}
+.mono{font-family:monospace;font-size:0.76rem}
 .chip{display:inline-block;border-radius:10px;padding:1px 8px;font-size:0.72rem;font-weight:600;margin-left:6px}
 .chip-yes{background:#238636;color:#fff}
 .chip-no{background:#21262d;color:#8b949e}
-@media(max-width:600px){.s-row{gap:10px}.s-kv{min-width:60px}}
+select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 6px;font-size:0.78rem;min-height:32px;touch-action:manipulation}
+input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
+/* ── MOBILE tweaks ── */
+@media(max-width:600px){
+  main{padding:10px 8px}
+  .card-body{padding:10px 10px}
+  .s-row{gap:8px}
+  .s-kv{min-width:58px}
+  .row{gap:6px}
+  button{font-size:0.78rem}
+  header h1{font-size:1rem}
+}
+@media(max-width:380px){
+  table{font-size:0.76rem}
+  th,td{padding:6px 7px}
+}
 </style>
 </head>
 <body>
@@ -931,22 +958,20 @@ tr:hover td{background:#1c2128}
 <div class="card">
   <div class="card-head">
     <h2>Target &amp; Capture</h2>
-    <div class="row">
-      <button class="btn-primary btn-sm" onclick="triggerScan()">Scan APs</button>
-    </div>
+    <button class="btn-primary btn-sm" onclick="triggerScan()">Scan APs</button>
   </div>
   <div class="card-body">
     <div class="target-info" id="targetBox">
       <span style="color:#8b949e">No target selected — scan APs below and click Select</span>
     </div>
     <div class="row" style="margin-top:10px">
-      <button class="btn-primary" id="btnStart"  onclick="startCapture()" disabled>▶ Start Capture</button>
+      <button class="btn-primary" id="btnStart"  onclick="startCapture()" disabled>▶ Start</button>
       <button class="btn-danger"  id="btnStop"   onclick="stopCapture()"  disabled>■ Stop</button>
-      <button class="btn-warn"    id="btnDeauth" onclick="sendDeauth()"   disabled>⚡ Deauth &amp; Capture</button>
-      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="clearBuf()">🗑 Clear Buffer</button>
+      <button class="btn-warn"    id="btnDeauth" onclick="sendDeauth()"   disabled>⚡ Deauth</button>
+      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="clearBuf()">🗑 Clear</button>
       <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="resetHs()">↺ Reset HS</button>
-      <label style="font-size:0.78rem;color:#8b949e">Bursts:
-        <select id="burstSel" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-size:0.78rem">
+      <label style="font-size:0.78rem;color:#8b949e;display:flex;align-items:center;gap:4px">Bursts:
+        <select id="burstSel">
           <option value="3">3</option>
           <option value="5" selected>5</option>
           <option value="10">10</option>
@@ -955,7 +980,7 @@ tr:hover td{background:#1c2128}
           <option value="50">50</option>
         </select>
       </label>
-      <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:#8b949e">
+      <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:#8b949e;cursor:pointer">
         <input type="checkbox" id="filterChk" checked> Filter BSSID
       </label>
     </div>
@@ -979,24 +1004,36 @@ tr:hover td{background:#1c2128}
     </div>
     <div class="row" style="margin-top:10px">
       <button class="btn-dl" onclick="download('/dl_pcap','handshake.pcap')">⬇ PCAP</button>
-      <button class="btn-dl" onclick="download('/dl_22000','handshake.22000')">⬇ hashcat 22000</button>
+      <button class="btn-dl" onclick="download('/dl_22000','handshake.22000')">⬇ 22000</button>
       <button class="btn-dl" onclick="download('/dl_json','capture.json')">⬇ JSON</button>
     </div>
   </div>
 </div>
 
-<!-- SCAN RESULTS -->
+<!-- SCAN RESULTS — horizontally slidable, vertically scrollable -->
 <div class="card">
   <div class="card-head">
     <h2>Nearby Networks</h2>
-    <span id="scanStatus" style="font-size:0.78rem;color:#8b949e"></span>
+    <span id="scanStatus" style="font-size:0.75rem;color:#8b949e"></span>
   </div>
-  <div class="card-body" style="padding:0">
+  <div class="tbl-scroll">
     <table>
-      <thead><tr><th>#</th><th>SSID</th><th>BSSID</th><th>CH</th><th>RSSI</th><th>ENC</th><th>Action</th></tr></thead>
-      <tbody id="scanBody"><tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px">
-        Click "Scan APs" to discover nearby networks
-      </td></tr></tbody>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>SSID</th>
+          <th>BSSID</th>
+          <th>CH</th>
+          <th>RSSI</th>
+          <th>ENC</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="scanBody">
+        <tr><td colspan="7" style="text-align:center;color:#8b949e;padding:22px;white-space:normal">
+          Tap <b>Scan APs</b> to discover nearby networks
+        </td></tr>
+      </tbody>
     </table>
   </div>
 </div>
@@ -1029,8 +1066,8 @@ function selectTarget(bssid, ch, ssid) {
 function triggerScan() {
   document.getElementById('scanStatus').textContent = 'Scanning\u2026';
   document.getElementById('scanBody').innerHTML =
-    '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:16px">Scanning\u2026</td></tr>';
-  fetch('/scan_trigger').then(()=>pollScan());
+    '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:18px;white-space:normal">Scanning\u2026</td></tr>';
+  fetch('/scan_trigger').then(()=>pollScan()).catch(()=>pollScan());
 }
 
 function pollScan() {
@@ -1038,7 +1075,7 @@ function pollScan() {
     if(html==='SCANNING'){setTimeout(pollScan,1200);return;}
     document.getElementById('scanBody').innerHTML = html;
     document.getElementById('scanStatus').textContent = '';
-  });
+  }).catch(()=>setTimeout(pollScan,2000));
 }
 
 function startCapture() {
@@ -1052,7 +1089,7 @@ function startCapture() {
       document.getElementById('capBadge').textContent='CAPTURING';
       document.getElementById('capBadge').style.background='#da363322';
       document.getElementById('capBadge').style.color='#f85149';
-    });
+    }).catch(()=>{});
 }
 
 function stopCapture() {
@@ -1063,7 +1100,7 @@ function stopCapture() {
     document.getElementById('capBadge').textContent='IDLE';
     document.getElementById('capBadge').style.background='';
     document.getElementById('capBadge').style.color='';
-  });
+  }).catch(()=>{});
 }
 
 function sendDeauth() {
@@ -1072,7 +1109,7 @@ function sendDeauth() {
   if(!capturing) startCapture();
   setTimeout(()=>{
     fetch('/deauth?bssid='+selBSSID+'&ch='+selCH+'&bursts='+bursts)
-      .then(r=>r.text()).then(t=>console.log('deauth:',t));
+      .then(r=>r.text()).then(t=>console.log('deauth:',t)).catch(()=>{});
   }, 600);
 }
 
@@ -1090,20 +1127,17 @@ function clearBuf() {
   fetch('/clear').then(r=>r.text()).then(t=>{
     logSeen.clear();
     document.getElementById('logBox').innerHTML='';
-    console.log('clear:', t);
     refreshStatus();
-  });
+  }).catch(()=>{});
 }
 
 function resetHs() {
-  fetch('/reset_hs').then(r=>r.text()).then(t=>{
-    console.log('reset_hs:', t);
-    refreshStatus();
-  });
+  fetch('/reset_hs').then(r=>r.text()).then(()=>refreshStatus()).catch(()=>{});
 }
 
-// O(1) dedup via Set — the old array .includes() was O(n) and slowed down at 200 lines
+// O(1) dedup via Set
 const logSeen = new Set();
+
 function refreshStatus() {
   fetch('/status').then(r=>r.json()).then(d=>{
     let ok='<span class="ok">\u2714</span>', no='<span class="na">\u2014</span>';
@@ -1118,19 +1152,21 @@ function refreshStatus() {
     document.getElementById('sBytes').textContent = d.cap_bytes
       ? (d.cap_bytes >= 1024 ? (d.cap_bytes/1024).toFixed(1)+'KB' : d.cap_bytes+'B')
       : '0';
-    if(d.capturing) {
+    if(d.capturing && !capturing) {
       document.getElementById('capBadge').textContent='CAPTURING';
+      document.getElementById('capBadge').style.background='#da363322';
+      document.getElementById('capBadge').style.color='#f85149';
     }
   }).catch(()=>{});
 
   fetch('/log').then(r=>r.text()).then(txt=>{
     if(!txt.trim()) return;
     let box=document.getElementById('logBox');
+    let atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     txt.trim().split('\n').forEach(line=>{
       if(!logSeen.has(line)){
         logSeen.add(line);
         if(logSeen.size>200){
-          // evict oldest: delete first entry from Set
           logSeen.delete(logSeen.values().next().value);
         }
         let p=document.createElement('p');
@@ -1140,7 +1176,8 @@ function refreshStatus() {
         box.appendChild(p);
       }
     });
-    box.scrollTop=box.scrollHeight;
+    // auto-scroll only if already at bottom — don't yank user mid-read
+    if(atBottom) box.scrollTop=box.scrollHeight;
   }).catch(()=>{});
 }
 
