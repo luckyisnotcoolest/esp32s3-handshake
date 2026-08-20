@@ -1539,12 +1539,24 @@ void setup() {
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   setupServer();
-  server.begin();
 
-  // DNS: answer every query with our AP IP — makes captive portal fire on connect
-  // Port 53 UDP. "*" wildcard catches all hostnames.
+  // DNS MUST start before server.begin() — on esp32 core 3.x the UDP socket
+  // binding order matters. DNS on port 53 first, then HTTP on port 80.
+  //
+  // TTL = 0: forces the OS to re-query every request instead of caching
+  // the first response. Without TTL=0, Android/iOS cache the redirect IP
+  // and stop sending DNS queries — the captive portal detection window
+  // closes after the first response and the popup never fires on reconnect.
+  //
+  // setErrorReplyCode(NoError): return NOERROR (not NXDOMAIN) for all
+  // queries. Some OS captive portal detectors treat NXDOMAIN as "no portal"
+  // and give up immediately. NOERROR with our IP keeps them probing.
+  dns.setTTL(0);
+  dns.setErrorReplyCode(DNSReplyCode::NoError);
   dns.start(53, "*", WiFi.softAPIP());
-  INFO("DNS captive portal up: *.* → %s", WiFi.softAPIP().toString().c_str());
+  INFO("DNS up: *.* → %s (TTL=0)", WiFi.softAPIP().toString().c_str());
+
+  server.begin();
 
   setLed(LS_GREEN);
   INFO("AP: %s  IP: %s  UI: http://%s/",
@@ -1556,9 +1568,13 @@ void setup() {
 
 // ─── LOOP ────────────────────────────────────────────────────────────────────
 void loop() {
-  dns.processNextRequest();   // sync DNSServer — must be polled each loop
+  // Process DNS twice per loop — at connect time the OS fires a burst of
+  // queries (A + AAAA + PTR) in rapid succession. A single processNextRequest()
+  // at 5ms interval drops most of them. Two calls at 1ms catches the burst.
+  dns.processNextRequest();
+  dns.processNextRequest();
   updateLED();
-  delay(5);
+  delay(1);
 }
 // DNSServer (sync, built-in to core) requires processNextRequest() each loop
 // iteration to service incoming DNS queries. Overhead is ~microseconds.
