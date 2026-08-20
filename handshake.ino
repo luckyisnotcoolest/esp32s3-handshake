@@ -1384,58 +1384,80 @@ void setupServer() {
   // We must respond correctly (not just redirect) or the OS marks the network
   // as "no internet" and suppresses the popup entirely.
   //
-  // iOS / macOS  — expects 200 + body containing "Success" (or specific text)
-  // Android      — expects 204 No Content at /generate_204
-  // Windows      — expects 200 + "Microsoft NCSI" body at /ncsi.txt
-  //                and connects to www.msftconnecttest.com/connecttest.txt
-  // Firefox      — expects 200 at /success.txt with body "success"
+  // ── CAPTIVE PORTAL DETECTION ──────────────────────────────────────────────
+  // Strategy: REDIRECT every OS probe to our web UI.
   //
-  // All other unknown hosts are caught by onNotFound → redirect to /.
+  // Returning the "expected" body (e.g. "Success", "Microsoft NCSI") tells
+  // the OS it has real internet access → popup is SUPPRESSED.
+  // Returning a 302 redirect tells the OS "captive portal detected" →
+  // OS shows the "Sign in to network" popup/notification automatically.
+  //
+  // Android /generate_204 is the exception: 204 = captive portal signal
+  // (Android specifically uses "no content" as the captive portal trigger,
+  //  unlike every other OS which uses redirect detection).
+  //
+  // Platform → probe URL → our response
+  // iOS 14+    /hotspot-detect.html         → 302 redirect
+  // iOS 14+    /library/test/success.html   → 302 redirect
+  // iOS 16+    /bag                         → 302 redirect
+  // macOS      /hotspot-detect.html         → 302 redirect
+  // macOS      /library/test/success.html   → 302 redirect
+  // Android    /generate_204                → 204 (triggers notification)
+  // Android    /gen_204                     → 204
+  // Android 7+ /connectivity-check.html     → 302 redirect
+  // Windows    /ncsi.txt                    → 302 redirect
+  // Windows    /connecttest.txt             → 302 redirect
+  // Windows    /redirect                    → 302 redirect
+  // Firefox    /success.txt                 → 302 redirect
+  // All other  *                            → 302 redirect (onNotFound)
 
-  // iOS / macOS captive portal check
+  // iOS / macOS
   server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/html",
-      "<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
-      "<BODY>Success</BODY></HTML>");
+    r->redirect("http://192.168.4.1/");
   });
-  // macOS Sonoma+ uses this path too
   server.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/html",
-      "<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
-      "<BODY>Success</BODY></HTML>");
+    r->redirect("http://192.168.4.1/");
+  });
+  server.on("/bag", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->redirect("http://192.168.4.1/");
   });
 
-  // Android / Chrome captive portal check
+  // Android — 204 is the correct captive portal signal on Android
   server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    // 204 triggers Android's "Sign in to network" notification
-    // Explicit args required for ESP32Async ESPAsyncWebServer 3.x
     r->send(204, "text/plain", "");
   });
-  // Android fallback
   server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send(204, "text/plain", "");
   });
+  // Android 7+ Chromium check
+  server.on("/connectivity-check.html", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->redirect("http://192.168.4.1/");
+  });
 
-  // Windows NCSI
+  // Windows NCSI — redirect triggers captive portal detection
   server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/plain", "Microsoft NCSI");
+    r->redirect("http://192.168.4.1/");
   });
   server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/plain", "Microsoft Connect Test");
+    r->redirect("http://192.168.4.1/");
   });
-  // Windows redirect check — must NOT redirect, must return 200
   server.on("/redirect", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/plain", "OK");
+    r->redirect("http://192.168.4.1/");
   });
 
-  // Firefox connectivity check
+  // Firefox
   server.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(200, "text/plain", "success");
+    r->redirect("http://192.168.4.1/");
   });
 
-  // Catch-all: any unrecognised path → redirect to UI
-  // This also fires for any unknown hostname because DNS resolves
-  // everything to 192.168.4.1 and the request lands here.
+  // Proxy autoconfig probe (Windows / corporate devices)
+  server.on("/wpad.dat", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->redirect("http://192.168.4.1/");
+  });
+
+  // Catch-all: ANY path not matched above → redirect to UI.
+  // DNS already resolves every hostname to 192.168.4.1 so every
+  // browser request (regardless of original domain) lands here.
   server.onNotFound([](AsyncWebServerRequest* r) {
     r->redirect("http://192.168.4.1/");
   });
