@@ -131,10 +131,14 @@ void updateLED() {
   LedState          s      = ledState;
 
   auto pulse = [&](uint32_t on, uint32_t off, uint32_t ms) {
-    if (millis() - tmr > ms) { tmr = millis(); bright = !bright; }
-    led.setPixelColor(0, bright ? led.Color(on>>16, on>>8&0xFF, on&0xFF)
-                                : led.Color(off>>16, off>>8&0xFF, off&0xFF));
-    led.show(); last = s;
+    bool toggled = (millis() - tmr > ms);
+    if (toggled) { tmr = millis(); bright = !bright; }
+    if (toggled || s != last) {
+      led.setPixelColor(0, bright ? led.Color(on>>16, on>>8&0xFF, on&0xFF)
+                                  : led.Color(off>>16, off>>8&0xFF, off&0xFF));
+      led.show();
+    }
+    last = s;
   };
 
   if (s == LS_PURPLE) { pulse(0x1C0020, 0x080010, 700); return; }
@@ -1524,6 +1528,10 @@ void setup() {
   WiFi.mode(WIFI_AP_STA); delay(300);
   applyCountry();  // apply after mode set — only needed once
 
+  // Pin AP address before softAP() — avoids DHCP startup delay on first connect
+  IPAddress apIP(192, 168, 4, 1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+
   bool apOk = false;
   for (int i = 0; i < 8 && !apOk; i++) {
     apOk = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4);
@@ -1579,7 +1587,7 @@ void loop() {
   dns.processNextRequest();
   dns.processNextRequest();
   updateLED();
-  delay(1);
+  delay(5);  // was 1ms — 5ms gives AsyncWebServer tasks ~4ms more headroom per tick
 }
 // DNSServer (sync, built-in to core) requires processNextRequest() each loop
 // iteration to service incoming DNS queries. Overhead is ~microseconds.
