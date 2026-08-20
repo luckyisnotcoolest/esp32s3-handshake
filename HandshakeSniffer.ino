@@ -1343,28 +1343,25 @@ void setupServer() {
     if (len <= sizeof(PcapGlobalHdr)) {
       r->send(404,"text/plain","No capture data. Start capture and trigger a handshake first."); return;
     }
-    // beginResponse_P is for PROGMEM/flash only — PSRAM/heap needs beginResponse.
-    // Snapshot the buffer into a local heap copy so the async send can't race
-    // with a concurrent capture that might advance g_capLen mid-send.
+    // Snapshot into heap buffer so async send can't race with live capture.
+    // We use AsyncResponseStream instead of the beginResponse(code,type,filler,len)
+    // overload because ESP32Async ESPAsyncWebServer v3.x swapped the last two
+    // args to (code,type,len,filler) — using AsyncResponseStream avoids the
+    // arg-order ambiguity and compiles cleanly on all supported versions.
     uint8_t* snap = (uint8_t*)malloc(len);
     if (!snap) { r->send(500,"text/plain","OOM"); return; }
     memcpy(snap, g_capBuf, len);
-    AsyncWebServerResponse* resp = r->beginResponse(
-      200, "application/octet-stream",
-      [snap, len](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
-        size_t remaining = len - index;
-        size_t chunk = remaining < maxLen ? remaining : maxLen;
-        if (chunk == 0) { free(snap); return 0; }
-        memcpy(buf, snap + index, chunk);
-        return chunk;
-      }, len);
-    resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.pcap\"");
-    r->send(resp);
+    AsyncResponseStream* rs = r->beginResponseStream("application/octet-stream");
+    rs->addHeader("Content-Disposition", "attachment; filename=\"handshake.pcap\"");
+    rs->write(snap, len);
+    free(snap);
+    r->send(rs);
     logEvent("PCAP served: %u bytes", (unsigned)len);
   });
 
   server.on("/dl_22000", HTTP_GET, [](AsyncWebServerRequest* r) {
     String out = build22000();
+    // Use send() directly with String body — unambiguous in all ESPAsyncWebServer versions
     AsyncWebServerResponse* resp = r->beginResponse(200, "text/plain", out);
     resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.22000\"");
     r->send(resp);
@@ -1407,11 +1404,12 @@ void setupServer() {
   // Android / Chrome captive portal check
   server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) {
     // 204 triggers Android's "Sign in to network" notification
-    r->send(204);
+    // Explicit args required for ESP32Async ESPAsyncWebServer 3.x
+    r->send(204, "text/plain", "");
   });
   // Android fallback
   server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->send(204);
+    r->send(204, "text/plain", "");
   });
 
   // Windows NCSI
@@ -1444,7 +1442,7 @@ void setup() {
   Serial0.begin(115200);
   delay(200);
   Serial0.println("\n==========================================");
-  Serial0.println("  HandshakeSniffer v1.2 — ESP32-S3");
+  Serial0.println("  HandshakeSniffer v1.3 — ESP32-S3");
   Serial0.println("==========================================\n");
 
   led.begin(); led.setBrightness(60); led.clear(); led.show();
