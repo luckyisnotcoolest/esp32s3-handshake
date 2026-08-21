@@ -163,26 +163,27 @@ jobs:
             }
 
             if [ -f ieee80211_output.o ]; then
-              COUNT=$(python3 - << 'PYEOF'
-import sys, pathlib
-data = pathlib.Path('ieee80211_output.o').read_bytes()
+              cat > count_pattern.py << 'EOF'
+import pathlib
+data = pathlib.Path("ieee80211_output.o").read_bytes()
 pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
 print(data.count(pattern))
-PYEOF
-              )
+EOF
+              COUNT=$(python3 count_pattern.py)
               echo "Stage B: pattern matches = $COUNT"
 
               if [ "$COUNT" = "1" ]; then
-                python3 - << 'PYEOF'
+                cat > patch_pattern.py << 'EOF'
 import pathlib
-p = pathlib.Path('ieee80211_output.o')
+p = pathlib.Path("ieee80211_output.o")
 data = bytearray(p.read_bytes())
 pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
 idx = data.index(pattern)
 data[idx] = 0x06
 p.write_bytes(data)
-print(f"Patched at offset 0x{idx:x}")
-PYEOF
+print("Patched at offset 0x{:x}".format(idx))
+EOF
+                python3 patch_pattern.py
                 "$AR" rcs libnet80211.a ieee80211_output.o
                 cp libnet80211.a "$LIBNET"
                 echo "Stage B: hex patch applied and repacked OK"
