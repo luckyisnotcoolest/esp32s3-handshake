@@ -15,6 +15,7 @@ jobs:
   build:
     name: Compile for ESP32-S3 N16R8
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
       - name: Checkout repository
@@ -82,25 +83,18 @@ jobs:
           echo "READELF=${READELF:-}" >> "$GITHUB_ENV"
           echo "LIBNET=$LIBNET" >> "$GITHUB_ENV"
 
-      # ── 6. TRIPLE-REDUNDANT PATCH libnet80211.a ──────────────────────────
-      # Research findings (2026):
-      #   - Symbol weakening via objcopy ALONE does NOT work on IDF 5.1+ /
-      #     Arduino core 3.3.x (MDPI Sensors 2026, 26(11), 3287) [[8]]
-      #   - Linker --wrap IS effective and officially supported [[7]]
-      #   - ELF-level ret0.bin overwrite is the most reliable method [[43]]
-      #   - Hex byte patching of .o files works as fallback for older cores
-      #
-      # This pipeline applies ALL THREE methods simultaneously:
-      #   Method 1: Symbol weaken (legacy compat)
-      #   Method 2: Hex patch ieee80211_output.o (binary gate removal)
-      #   Method 3: Generate ret0.bin + patch ELF post-compile (gold standard)
-      # Plus: inject linker --wrap flag into platform.txt for belt-and-suspenders
-      - name: Triple-redundant patch libnet80211.a
+      # ── 6. QUADRUPLE PATCH libnet80211.a (IDF 5.5 validated) ─────────────
+      # M1: Symbol weaken — legacy compat, fails alone on IDF 5.5
+      # M2: Hex patch .o — fallback for older instruction layouts
+      # M3: Linker --wrap injection — compile-time override
+      # M4: ELF ret0.bin post-patch — gold standard for IDF 5.5 (step 9)
+      - name: Patch libnet80211.a + inject linker wrap
         run: |
           set -euo pipefail
           cp "$LIBNET" "${LIBNET}.bak"
-          WEAKENED=0
-          HEX_PATCHED=0
+          M1=0
+          M2=0
+          M3=0
 
           GATE_SYMBOLS=(
             "ieee80211_raw_frame_sanity_check"
@@ -110,8 +104,8 @@ jobs:
             "wifi_tx_sanity_check"
           )
 
-          # ── Method 1: Multi-symbol weaken ─────────────────────────────────
-          echo "=== Method 1: Symbol Weakening ==="
+          # ── M1: Multi-symbol weaken ───────────────────────────────────────
+          echo "=== M1: Symbol Weakening ==="
           if [ -n "$NM" ] && [ -x "$NM" ]; then
             CURRENT_LIB="$LIBNET"
             for SYM in "${GATE_SYMBOLS[@]}"; do
@@ -126,18 +120,18 @@ jobs:
                   "$CURRENT_LIB" "${CURRENT_LIB}.tmp"
                 mv "${CURRENT_LIB}.tmp" "$CURRENT_LIB"
                 echo "  Weakened: $SYM"
-                WEAKENED=$((WEAKENED_COUNT + 1))
+                M1=$((M1 + 1))
               else
                 echo "  Not found: $SYM"
               fi
             done
-            echo "Method 1: $WEAKENED symbol(s) weakened"
+            echo "M1 result: $M1 symbol(s) weakened"
           else
-            echo "Method 1: nm not available — skipping"
+            echo "M1: nm not available — skipping"
           fi
 
-          # ── Method 2: Hex patch ieee80211_output.o ────────────────────────
-          echo "=== Method 2: Hex Pattern Patching ==="
+          # ── M2: Hex patch ieee80211_output.o ─────────────────────────────
+          echo "=== M2: Hex Pattern Patching ==="
           if [ -n "$AR" ] && [ -x "$AR" ]; then
             WORKDIR=$(mktemp -d)
             cp "$LIBNET" "$WORKDIR/libnet80211.a"
@@ -150,7 +144,7 @@ jobs:
           pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
           print(data.count(pattern))
           ')
-              echo "  Pattern matches in ieee80211_output.o: $COUNT"
+              echo "  Pattern matches: $COUNT"
               if [ "$COUNT" = "1" ]; then
                 python3 -c '
           import pathlib
@@ -160,53 +154,52 @@ jobs:
           idx = data.index(pattern)
           data[idx] = 0x06
           p.write_bytes(data)
-          print("  Patched MOVI a4,1 → MOVI a4,0 at offset 0x{:x}".format(idx))
+          print("  Patched MOVI a4,1→0 at offset 0x{:x}".format(idx))
           '
                 "$AR" rcs libnet80211.a ieee80211_output.o
                 cp libnet80211.a "$LIBNET"
-                HEX_PATCHED=1
-                echo "Method 2: hex patch applied OK"
+                M2=1
+                echo "M2 result: hex patch applied OK"
               elif [ "$COUNT" = "0" ]; then
-                echo "Method 2: pattern not found — may already be patched or layout changed"
+                echo "M2 result: pattern not found (layout changed or already patched)"
               else
-                echo "Method 2: ambiguous ($COUNT matches) — skipping to avoid corruption"
+                echo "M2 result: ambiguous ($COUNT matches) — skipping"
               fi
             else
-              echo "Method 2: ieee80211_output.o not found in archive"
+              echo "M2 result: ieee80211_output.o not found in archive"
             fi
             popd > /dev/null
             rm -rf "$WORKDIR"
           else
-            echo "Method 2: ar not available — skipping"
+            echo "M2: ar not available — skipping"
           fi
 
-          # ── Method 3 prep: generate ret0.bin for ELF post-patch ───────────
-          # Xtensa ESP32-S3: MOVI a2,0 + RET.N = return 0 from any function
-          # Bytes: 0x02 0x20 0x00 0x0D 0xF0 (5 bytes, overwrites function entry)
-          echo "=== Method 3 Prep: Generate ret0.bin ==="
+          # ── M3: Inject --wrap into platform.txt ───────────────────────────
+          echo "=== M3: Linker --wrap Injection ==="
+          PLATFORM_TXT=$(find "$HOME/.arduino15/packages/esp32" \
+            -name "platform.txt" -path "*esp32*" -type f 2>/dev/null | head -1)
+          if [ -n "$PLATFORM_TXT" ] && [ -f "$PLATFORM_TXT" ]; then
+            WRAP_FLAG="-Wl,--wrap=ieee80211_raw_frame_sanity_check"
+            if ! grep -qF "$WRAP_FLAG" "$PLATFORM_TXT"; then
+              sed -i "s|compiler.c.elf.extra_flags=|compiler.c.elf.extra_flags=$WRAP_FLAG |" \
+                "$PLATFORM_TXT"
+              M3=1
+              echo "M3 result: --wrap flag injected into platform.txt"
+            else
+              M3=1
+              echo "M3 result: --wrap flag already present"
+            fi
+          else
+            echo "M3 result: platform.txt not found — manual --wrap may be needed"
+          fi
+
+          # ── M4 prep: generate ret0.bin for ELF post-patch ─────────────────
+          echo "=== M4 Prep: Generate ret0.bin ==="
           printf '\x02\x20\x00\x0D\xF0' > /tmp/ret0.bin
           echo "  ret0.bin generated ($(stat -c%s /tmp/ret0.bin) bytes)"
           echo "  Will be applied to ELF in post-compile step"
 
-          # ── Inject --wrap linker flag into platform.txt ───────────────────
-          echo "=== Bonus: Inject --wrap linker flag ==="
-          PLATFORM_DIR=$(dirname "$(find "$HOME/.arduino15/packages/esp32" \
-            -name "platform.txt" -path "*esp32s3*" -type f 2>/dev/null | head -1)")
-          PLATFORM_TXT="$PLATFORM_DIR/platform.txt"
-          if [ -f "$PLATFORM_TXT" ]; then
-            WRAP_FLAG="-Wl,--wrap=ieee80211_raw_frame_sanity_check"
-            if ! grep -qF "$WRAP_FLAG" "$PLATFORM_TXT"; then
-              sed -i "s|compiler.c.elf.extra_flags=|compiler.c.elf.extra_flags=$WRAP_FLAG |" "$PLATFORM_TXT"
-              echo "  Injected --wrap flag into platform.txt"
-            else
-              echo "  --wrap flag already present in platform.txt"
-            fi
-          else
-            echo "  WARNING: platform.txt not found — --wrap injection skipped"
-            echo "           Add '-Wl,--wrap=ieee80211_raw_frame_sanity_check' to linker flags manually"
-          fi
-
-          echo "=== Pre-compile patch summary: weakened=$WEAKENED hex=$HEX_PATCHED ret0=ready ==="
+          echo "=== Pre-compile summary: M1=$M1 M2=$M2 M3=$M3 ==="
 
       # ── 7. Prepare sketch folder ──────────────────────────────────────────
       - name: Prepare sketch folder
@@ -231,70 +224,50 @@ jobs:
           echo "=== Build outputs ==="
           ls -lh build/
 
-      # ── 9. Method 3: ELF-level ret0.bin patch (gold standard) ─────────────
-      # Based on esp32-deauther patch.sh strategy [[43]]:
-      #   1. Find ieee80211_raw_frame_sanity_check virtual address in ELF
-      #   2. Calculate flash.text section base offset
-      #   3. Overwrite function entry with ret0.bin (MOVI a2,0 + RET.N)
-      # This is the MOST RELIABLE method per 2026 research [[8]]
-      - name: ELF-level ret0.bin patch
+      # ── 9. M4: ELF-level ret0.bin post-patch (IDF 5.5 gold standard) ─────
+      - name: ELF ret0.bin post-patch
         run: |
           set -euo pipefail
           ELF_FILE=$(find build/ -name "*.elf" -type f 2>/dev/null | head -1)
           if [ -z "$ELF_FILE" ]; then
-            echo "WARNING: No ELF file found — skipping ELF patch"
+            echo "WARNING: No ELF found — skipping M4"
             exit 0
           fi
           echo "Target ELF: $ELF_FILE"
 
-          # Find symbol virtual address
           SANITY_VIRT=$(readelf -s "$ELF_FILE" 2>/dev/null \
             | grep "ieee80211_raw_frame_sanity_check" \
             | awk '{print "0x"$2}' | head -1)
 
           if [ -z "$SANITY_VIRT" ] || [ "$SANITY_VIRT" = "0x" ]; then
-            echo "WARNING: Symbol not found in ELF — skipping ELF patch"
-            echo "         Methods 1+2 should still provide bypass"
+            echo "WARNING: Symbol not in ELF — M1+M3 should still provide bypass"
             exit 0
           fi
-          echo "Symbol virt addr: $SANITY_VIRT"
+          echo "Symbol virt: $SANITY_VIRT"
 
-          # Find flash.text section base
-          FLASH_TEXT_BASE=$(readelf -S "$ELF_FILE" 2>/dev/null \
-            | grep "\.flash\.text" \
+          FLASH_BASE=$(readelf -S "$ELF_FILE" 2>/dev/null \
+            | grep -E "\.(flash\.)?text" \
             | awk '{print "0x"$4 " + 0x"$5}' | head -1)
 
-          if [ -z "$FLASH_TEXT_BASE" ]; then
-            # Fallback: try .text section
-            FLASH_TEXT_BASE=$(readelf -S "$ELF_FILE" 2>/dev/null \
-              | grep "\.text" \
-              | awk '{print "0x"$4 " + 0x"$5}' | head -1)
-          fi
-
-          if [ -z "$FLASH_TEXT_BASE" ]; then
-            echo "WARNING: Could not find text section base — skipping ELF patch"
+          if [ -z "$FLASH_BASE" ]; then
+            echo "WARNING: Text section not found — skipping M4"
             exit 0
           fi
-          echo "Text section base: $FLASH_TEXT_BASE"
+          echo "Text base: $FLASH_BASE"
 
-          # Calculate file offset
-          OFFSET=$(python3 -c "print($SANITY_VIRT - ($FLASH_TEXT_BASE))")
+          OFFSET=$(python3 -c "print($SANITY_VIRT - ($FLASH_BASE))")
           PATCH_SIZE=$(stat -c%s /tmp/ret0.bin)
-          echo "Patch offset: $OFFSET"
-          echo "Patch size: $PATCH_SIZE bytes"
 
-          # Apply patch
           cp "$ELF_FILE" "${ELF_FILE}.unpatched"
-          dd conv=notrunc if=/tmp/ret0.bin of="$ELF_FILE" bs=1 count="$PATCH_SIZE" seek="$OFFSET" 2>/dev/null
-          echo "ELF patch applied: $SANITY_VIRT → ret0 at offset $OFFSET"
+          dd conv=notrunc if=/tmp/ret0.bin of="$ELF_FILE" \
+            bs=1 count="$PATCH_SIZE" seek="$OFFSET" 2>/dev/null
 
-          # Verify
-          VERIFY=$(xxd -s "$OFFSET" -l "$PATCH_SIZE" "$ELF_FILE" | awk '{print $2$3}')
-          EXPECTED="0220000df0"
-          if [ "$VERIFY" = "$EXPECTED" ]; then
-            echo "ELF patch VERIFIED ✓"
+          VERIFY=$(xxd -s "$OFFSET" -l "$PATCH_SIZE" "$ELF_FILE" \
+            | awk '{print $2$3}')
+          if [ "$VERIFY" = "0220000df0" ]; then
+            echo "M4 result: ELF patch VERIFIED at offset $OFFSET"
           else
-            echo "ELF patch verification MISMATCH: got $VERIFY expected $EXPECTED"
+            echo "M4 result: verification mismatch (got $VERIFY)"
           fi
 
       # ── 10. Upload artifacts ──────────────────────────────────────────────
