@@ -163,27 +163,25 @@ jobs:
             }
 
             if [ -f ieee80211_output.o ]; then
-              cat > count_pattern.py << 'EOF'
-              import pathlib
-              data = pathlib.Path("ieee80211_output.o").read_bytes()
-              pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
-              print(data.count(pattern))
-              EOF
-              COUNT=$(python3 count_pattern.py)
+              COUNT=$(python3 -c '
+import pathlib
+data = pathlib.Path("ieee80211_output.o").read_bytes()
+pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
+print(data.count(pattern))
+')
               echo "Stage B: pattern matches = $COUNT"
 
               if [ "$COUNT" = "1" ]; then
-                cat > patch_pattern.py << 'EOF'
-                import pathlib
-                p = pathlib.Path("ieee80211_output.o")
-                data = bytearray(p.read_bytes())
-                pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
-                idx = data.index(pattern)
-                data[idx] = 0x06
-                p.write_bytes(data)
-                print("Patched at offset 0x{:x}".format(idx))
-                EOF
-                python3 patch_pattern.py
+                python3 -c '
+import pathlib
+p = pathlib.Path("ieee80211_output.o")
+data = bytearray(p.read_bytes())
+pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
+idx = data.index(pattern)
+data[idx] = 0x06
+p.write_bytes(data)
+print("Patched at offset 0x{:x}".format(idx))
+'
                 "$AR" rcs libnet80211.a ieee80211_output.o
                 cp libnet80211.a "$LIBNET"
                 echo "Stage B: hex patch applied and repacked OK"
