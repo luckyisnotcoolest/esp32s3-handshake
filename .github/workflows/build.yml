@@ -1,4 +1,4 @@
-name: Build handshake.ino (ESP32-S3 N16R8U)
+name: Build handshake.ino (ESP32-S3 N16R8 — Headless CDC)
 
 on:
   push:
@@ -14,14 +14,16 @@ jobs:
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Cache toolchain + libs
+      # ── Toolchain cache ──────────────────────────────────────────────────────
+      # Only the ESP32 core is cached. The async libraries are gone — headless
+      # build has zero external library dependencies beyond the core.
+      - name: Cache toolchain
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.arduino15/packages/esp32
-            ~/Arduino/libraries
+          path: ~/.arduino15/packages/esp32
           key: esp32-3.3.11-${{ hashFiles('build.yml') }}
 
+      # ── Core install ─────────────────────────────────────────────────────────
       - name: Install ESP32 core 3.3.11
         run: |
           set -euo pipefail
@@ -34,177 +36,204 @@ jobs:
             echo "FATAL: core 3.3.11 not installed"; exit 1;
           }
 
-      - name: Install Async libraries (pinned tags)
-        run: |
-          set -euo pipefail
-          LIBDIR="$HOME/Arduino/libraries"
-          mkdir -p "$LIBDIR"
-          # Pin to a known-compatible pair that accepts the classic
-          # beginResponse(contentType, len, filler) overload.
-          # Always remove first so cache cannot leave a newer version.
-          rm -rf "$LIBDIR/AsyncTCP" "$LIBDIR/ESPAsyncWebServer"
-          git clone --branch v3.3.2 --depth 1 \
-            https://github.com/ESP32Async/AsyncTCP.git "$LIBDIR/AsyncTCP"
-          git clone --branch v3.6.0 --depth 1 \
-            https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
-          git -C "$LIBDIR/AsyncTCP" describe --tags --exact-match
-          git -C "$LIBDIR/ESPAsyncWebServer" describe --tags --exact-match
-
-      - name: Locate toolchain tools (prefer version-sorted, explicit)
+      # ── Locate toolchain binaries ─────────────────────────────────────────────
+      - name: Locate toolchain tools
         run: |
           set -euo pipefail
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
           PKG="$HOME/.arduino15/packages/esp32"
 
-          # Prefer the highest versioned toolchain that contains the tools
           OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f | sort -V | tail -1)
-          NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm" -type f | sort -V | tail -1)
+          NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm"      -type f | sort -V | tail -1)
           READELF=$(find "$TOOLS" -name "xtensa-esp32s3-elf-readelf" -type f | sort -V | tail -1)
-          AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar" -type f | sort -V | tail -1)
+          AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar"      -type f | sort -V | tail -1)
           OBJDUMP=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objdump" -type f | sort -V | tail -1)
 
-          # libnet80211.a lives under different layouts depending on core packaging.
-          # Prefer paths containing "esp32s3", fall back to any match.
+          # libnet80211.a — prefer esp32s3-tagged path, fall back to any match
           LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | \
             grep -i esp32s3 | sort -V | tail -1 || true)
           if [ -z "$LIBNET" ]; then
-            LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | sort -V | tail -1 || true)
+            LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | \
+              sort -V | tail -1 || true)
           fi
 
           [ -x "$OBJCOPY" ] || { echo "FATAL: objcopy missing"; exit 1; }
-          [ -x "$NM" ]      || { echo "FATAL: nm missing"; exit 1; }
+          [ -x "$NM"      ] || { echo "FATAL: nm missing"; exit 1; }
           [ -x "$READELF" ] || { echo "FATAL: readelf missing"; exit 1; }
-          [ -x "$AR" ]      || { echo "FATAL: ar missing"; exit 1; }
+          [ -x "$AR"      ] || { echo "FATAL: ar missing"; exit 1; }
           [ -x "$OBJDUMP" ] || { echo "FATAL: objdump missing"; exit 1; }
-          [ -f "$LIBNET" ]  || {
-            echo "FATAL: libnet80211.a missing"
-            echo "=== Searching entire package tree ==="
-            find "$PKG" -name "libnet80211.a" -type f 2>/dev/null || true
-            find "$PKG" -name "*.a" \( -path "*wifi*" -o -path "*net802*" \) -type f 2>/dev/null | head -30 || true
-            ls -la "$PKG" || true
+          [ -f "$LIBNET"  ] || {
+            echo "FATAL: libnet80211.a not found"
+            find "$PKG" -name "libnet80211.a" 2>/dev/null || true
             exit 1
           }
 
-          echo "OBJCOPY=$OBJCOPY" >> $GITHUB_ENV
-          echo "NM=$NM"           >> $GITHUB_ENV
-          echo "READELF=$READELF" >> $GITHUB_ENV
-          echo "AR=$AR"           >> $GITHUB_ENV
-          echo "OBJDUMP=$OBJDUMP" >> $GITHUB_ENV
-          echo "LIBNET=$LIBNET"   >> $GITHUB_ENV
+          {
+            echo "OBJCOPY=$OBJCOPY"
+            echo "NM=$NM"
+            echo "READELF=$READELF"
+            echo "AR=$AR"
+            echo "OBJDUMP=$OBJDUMP"
+            echo "LIBNET=$LIBNET"
+          } >> "$GITHUB_ENV"
 
-          echo "Selected tools:"
-          echo "  OBJCOPY=$OBJCOPY"
-          echo "  NM=$NM"
-          echo "  READELF=$READELF"
-          echo "  AR=$AR"
-          echo "  OBJDUMP=$OBJDUMP"
-          echo "  LIBNET=$LIBNET"
+          echo "OBJCOPY : $OBJCOPY"
+          echo "NM      : $NM"
+          echo "READELF : $READELF"
+          echo "AR      : $AR"
+          echo "OBJDUMP : $OBJDUMP"
+          echo "LIBNET  : $LIBNET"
 
-      - name: Identify referencing object inside libnet80211.a
+      # ── Identify which .o inside the archive owns the symbol ─────────────────
+      - name: Identify referencing object in libnet80211.a
         run: |
           set -euo pipefail
           TMP=$(mktemp -d)
           trap 'rm -rf "$TMP"' EXIT
           cd "$TMP"
           "$AR" x "$LIBNET"
-          echo "=== Objects that reference ieee80211_raw_frame_sanity_check ==="
+          echo "=== Objects referencing ieee80211_raw_frame_sanity_check ==="
           REF_OBJS=""
           for o in *.o; do
             if "$NM" "$o" 2>/dev/null | grep -q "ieee80211_raw_frame_sanity_check"; then
               echo "  $o"
+              "$NM" "$o" | grep "ieee80211_raw_frame_sanity_check"
               REF_OBJS="$REF_OBJS $o"
-              "$NM" "$o" | grep "ieee80211_raw_frame_sanity_check" || true
             fi
           done
-          if [ -z "$REF_OBJS" ]; then
-            echo "WARN: no object inside archive references the symbol"
-          fi
-          echo "REF_OBJS=$REF_OBJS" >> $GITHUB_ENV
+          [ -n "$REF_OBJS" ] || echo "WARN: symbol not found in any object — patch may be a no-op"
+          echo "REF_OBJS=$REF_OBJS" >> "$GITHUB_ENV"
 
-      - name: Patch archive — weaken + inject strong override object
+      # ── Weaken the library symbol so our strong sketch definition wins ────────
+      - name: Patch libnet80211.a — weaken ieee80211_raw_frame_sanity_check
         run: |
           set -euo pipefail
-          # Strategy: weaken the library definition so our strong definition
-          # (provided by the sketch) can win at link time. This is not
-          # equivalent to --wrap; it relies on the linker preferring a
-          # strong global over a weak one when both are present.
-          echo "=== BEFORE patch ==="
+
+          echo "=== BEFORE ==="
           "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
 
           "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check \
             "$LIBNET" "$LIBNET.patched"
           mv "$LIBNET.patched" "$LIBNET"
 
-          echo "=== AFTER weaken ==="
+          echo "=== AFTER ==="
           AFTER=$("$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true)
           echo "$AFTER"
 
-          # Require the symbol to actually be weak (W/w). Reject residual T/t.
+          # Require symbol to be weak (W/w); fail if still strong (T/t)
           if echo "$AFTER" | grep -qE " [Tt] "; then
-            echo "FATAL: symbol still GLOBAL/TEXT after weaken"
+            echo "FATAL: symbol is still GLOBAL TEXT after --weaken-symbol"
             exit 1
           fi
           if ! echo "$AFTER" | grep -qE " [Ww] "; then
-            echo "FATAL: symbol did not become weak (W/w) after --weaken-symbol"
+            echo "FATAL: symbol did not become weak — check objcopy version"
             exit 1
           fi
-          echo "Weaken verified: symbol is now weak"
+          echo "Weaken OK: symbol is now weak"
 
-          # Sanity: archive still valid
-          "$AR" t "$LIBNET" >/dev/null || { echo "FATAL: archive corrupted after patch"; exit 1; }
+          "$AR" t "$LIBNET" >/dev/null || { echo "FATAL: archive corrupted"; exit 1; }
           echo "Archive integrity OK"
 
+      # ── Compile ───────────────────────────────────────────────────────────────
+      #
+      # FQBN breakdown — every flag explained:
+      #
+      #   PartitionScheme=huge_app
+      #     4 MB app partition — headless build is ~700-900 KB but huge_app
+      #     gives headroom and removes the OTA partition we don't need.
+      #
+      #   CDCOnBoot=cdc                        ← KEY FIX (was "default")
+      #     "default" does NOT enable the USB CDC serial port before setup()
+      #     runs; the port may miss early Serial.write() calls and Android
+      #     drivers may fail to enumerate. "cdc" installs the CDC-ACM driver
+      #     in the ROM bootloader path so the port is live from power-on.
+      #     This is what makes "Serial USB Terminal" see the device on OTG
+      #     without root: it enumerates as a standard USB CDC-ACM class device
+      #     (bInterfaceClass 0x0A) which Android supports natively since API 12.
+      #
+      #   USBMode=hwcdc
+      #     Routes Serial through the ESP32-S3's built-in USB Serial/JTAG
+      #     hardware (not the soft USB stack). The hardware CDC is more stable
+      #     at high throughput and doesn't require a separate CH340/CP2102 chip.
+      #
+      #   PSRAM=opi
+      #     Enables the OPI (Octal SPI) PSRAM present on the N16R8 variant.
+      #     Without this flag xRingbufferCreateWithCaps(MALLOC_CAP_SPIRAM)
+      #     will fail silently and fall back to internal RAM, cutting the
+      #     ring buffer from 256 KB to the 32 KB fallback.
+      #
+      #   FlashSize=16M, FlashMode=qio
+      #     Match the N16R8 hardware. Wrong values here corrupt the flash map
+      #     and produce "Failed to load partition table" at boot.
+      #
+      #   CPUFreq=240
+      #     Maximum core frequency. The drain task benefits from fast USB
+      #     write throughput; lower frequencies can cause ring buffer drops
+      #     on dense deauth → reassociate → EAPOL bursts.
+      #
+      #   DebugLevel=none
+      #     Strips ESP-IDF log output from the binary. Any SDK log lines that
+      #     leaked onto the CDC port would corrupt the PCAP stream.
+      #
       - name: Compile
         run: |
           set -euo pipefail
           mkdir -p handshake
           cp handshake.ino handshake/
-          # Explicit FQBN for ESP32-S3 N16R8U characteristics
-          FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app,CDCOnBoot=default,CPUFreq=240,PSRAM=opi,USBMode=hwcdc,FlashMode=qio,FlashSize=16M,DebugLevel=none,UploadSpeed=921600"
-          echo "FQBN=$FQBN"
+
+          FQBN="esp32:esp32:esp32s3:\
+          PartitionScheme=huge_app,\
+          CDCOnBoot=cdc,\
+          USBMode=hwcdc,\
+          PSRAM=opi,\
+          FlashMode=qio,\
+          FlashSize=16M,\
+          CPUFreq=240,\
+          DebugLevel=none,\
+          UploadSpeed=921600"
+
+          # Strip spaces/newlines that YAML continuations may have introduced
+          FQBN=$(echo "$FQBN" | tr -d ' \n')
+          echo "FQBN: $FQBN"
+
           arduino-cli compile --fqbn "$FQBN" --output-dir build handshake
           ls -lh build/
 
-      - name: Verify symbol resolution in final ELF
+      # ── Verify symbol resolution in the final ELF ─────────────────────────────
+      - name: Verify symbol resolution
         run: |
           set -euo pipefail
           ELF=$(find build -name "*.elf" | sort | head -1)
           [ -f "$ELF" ] || { echo "FATAL: ELF not found"; exit 1; }
           echo "ELF: $ELF"
 
-          # 1. Symbol table: must be defined (T/t), not undefined (U)
           SYM=$("$NM" "$ELF" | grep -w "ieee80211_raw_frame_sanity_check" || true)
-          echo "Symbol line: $SYM"
+          echo "Symbol in ELF: $SYM"
           [ -n "$SYM" ] || { echo "FATAL: symbol absent from ELF"; exit 1; }
+
           if echo "$SYM" | grep -qE " [Uu] "; then
-            echo "FATAL: symbol is undefined reference — override did not bind"
+            echo "FATAL: symbol is undefined — strong override did not link"
             exit 1
           fi
           if ! echo "$SYM" | grep -qE " [Tt] "; then
             echo "FATAL: unexpected binding (expected T/t): $SYM"
             exit 1
           fi
-          echo "Symbol is defined (T/t) in final binary"
+          echo "PASS: symbol is T (strong, defined) in final ELF"
 
-          # 2. Relocation analysis: show how references were resolved
-          echo "=== Relocations referencing the symbol ==="
-          "$READELF" -r "$ELF" 2>/dev/null | grep -A2 -B2 "ieee80211_raw_frame_sanity_check" || \
-            echo "(no dynamic relocations shown; static resolution expected)"
-
-          # 3. Disassembly of the override itself (proof it is our code)
-          echo "=== Disassembly of override function ==="
+          echo "=== Disassembly of override (proof it is our return-0 stub) ==="
           "$OBJDUMP" -d "$ELF" 2>/dev/null | \
-            awk '/<ieee80211_raw_frame_sanity_check>:/,/^$/' | head -40 || true
+            awk '/<ieee80211_raw_frame_sanity_check>:/,/^$/' | head -20 || true
 
-          # 4. Confirm archive still contains only weak definition
-          echo "=== Library symbol state (post-link) ==="
+          echo "=== Library symbol state (should still be weak W) ==="
           "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
 
-          echo "Verification complete: strong definition present; library definition remains weak"
+          echo "Verification complete."
 
-      - name: Upload
+      # ── Upload firmware artifact ───────────────────────────────────────────────
+      - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: handshake-n16r8u
+          name: handshake-n16r8-headless-cdc
           path: build/
           retention-days: 30
