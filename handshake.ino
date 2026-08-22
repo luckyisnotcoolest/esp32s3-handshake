@@ -438,14 +438,15 @@ void setupServer() {
       free(snap); r->send(503, "text/plain", "busy"); return;
     }
 
-    auto* resp = r->beginResponse(200, "application/octet-stream",
+    // ESPAsyncWebServer 3.x: beginResponse(contentType, len, filler)
+    auto* resp = r->beginResponse("application/octet-stream", len,
       [snap, len](uint8_t* buf, size_t maxLen, size_t idx) -> size_t {
         size_t rem = len - idx;
         size_t n = rem < maxLen ? rem : maxLen;
         if (n == 0) { free(snap); return 0; }
         memcpy(buf, snap + idx, n);
         return n;
-      }, len);
+      });
     resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.pcap\"");
     r->send(resp);
   });
