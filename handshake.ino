@@ -312,20 +312,27 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0b0e14;color:#e2e8f0;font-family:system-ui;padding:16px}
-.card{background:#12161f;border:1px solid #1c2333;border-radius:12px;padding:20px;max-width:420px;margin:0 auto}
+.card{background:#12161f;border:1px solid #1c2333;border-radius:12px;padding:20px;max-width:440px;margin:0 auto}
 h1{font-size:20px;color:#00d4aa;margin-bottom:4px}
 .sub{font-size:11px;color:#64748b;margin-bottom:16px}
 label{display:block;font-size:11px;color:#94a3b8;margin-bottom:4px;text-transform:uppercase}
 input,select{width:100%;padding:10px;background:#07090e;border:1px solid #1c2333;border-radius:8px;color:#e2e8f0;font-size:14px;margin-bottom:12px}
 .btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px}
 .btn-go{background:#00d4aa;color:#0b0e14}.btn-stop{background:#be123c;color:#fff}
-.btn-dl{background:#0369a1;color:#fff}
+.btn-dl{background:#0369a1;color:#fff}.btn-scan{background:#7c3aed;color:#fff}
 .st{font-family:monospace;font-size:12px;background:#07090e;border-radius:8px;padding:12px;margin-top:10px;line-height:1.6;color:#94a3b8}
 .st b{color:#00d4aa}.ok{color:#4ade80}.warn{color:#f87171}
+#list{max-height:220px;overflow-y:auto;margin-bottom:12px}
+.ap{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border:1px solid #1c2333;border-radius:8px;margin-bottom:6px;cursor:pointer;background:#07090e}
+.ap:hover{border-color:#00d4aa}
+.ap .n{font-size:13px;color:#e2e8f0}.ap .m{font-size:10px;color:#64748b;font-family:monospace}
+.ap .r{font-size:11px;color:#94a3b8;text-align:right}
 </style></head><body>
 <div class=card>
 <h1>Handshake Capture</h1>
-<div class=sub>ESP32-S3 · deauth + EAPOL sniff · PCAP</div>
+<div class=sub>ESP32-S3 · scan · deauth · EAPOL · PCAP</div>
+<button class="btn btn-scan" onclick=scan()>SCAN NETWORKS</button>
+<div id=list></div>
 <label>Target BSSID</label>
 <input id=bssid placeholder=AA:BB:CC:DD:EE:FF maxlength=17 style=text-transform:uppercase;font-family:monospace>
 <label>Channel</label>
@@ -340,6 +347,29 @@ input,select{width:100%;padding:10px;background:#07090e;border:1px solid #1c2333
 <div class=st id=st>Ready</div>
 </div>
 <script>
+function scan(){
+  document.getElementById('st').textContent='Scanning…';
+  document.getElementById('list').innerHTML='';
+  fetch('/scan').then(r=>r.json()).then(arr=>{
+    const list=document.getElementById('list');
+    if(!arr.length){list.innerHTML='<div class=st>No APs found</div>';return}
+    arr.sort((a,b)=>b.rssi-a.rssi);
+    arr.forEach(ap=>{
+      const d=document.createElement('div');
+      d.className='ap';
+      d.innerHTML='<div><div class=n>'+esc(ap.ssid||'(hidden)')+'</div><div class=m>'+ap.bssid+'</div></div>'+
+                  '<div class=r>CH '+ap.ch+'<br>'+ap.rssi+' dBm</div>';
+      d.onclick=()=>{
+        document.getElementById('bssid').value=ap.bssid;
+        document.getElementById('ch').value=String(ap.ch);
+        document.getElementById('st').textContent='Selected '+ap.ssid+' / '+ap.bssid+' CH'+ap.ch;
+      };
+      list.appendChild(d);
+    });
+    document.getElementById('st').textContent='Found '+arr.length+' AP(s) — tap to select';
+  }).catch(e=>{document.getElementById('st').textContent='Scan failed';});
+}
+function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function go(){
   const b=document.getElementById('bssid').value.trim().toUpperCase();
   const c=document.getElementById('ch').value;
@@ -366,6 +396,39 @@ function poll(){
 void setupServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){
     r->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  // Blocking scan on STA interface (AP stays up under AP+STA)
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (g_capturing.load()) {
+      r->send(409, "text/plain", "busy capturing"); return;
+    }
+    // Ensure STA is up for scan
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA) {
+      esp_wifi_set_mode(WIFI_MODE_APSTA);
+      delay(50);
+    }
+    int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+      if (i) json += ',';
+      String ssid = WiFi.SSID(i);
+      ssid.replace("\\", "\\\\");
+      ssid.replace("\"", "\\\"");
+      char bssid[18];
+      uint8_t* b = WiFi.BSSID(i);
+      snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+               b[0], b[1], b[2], b[3], b[4], b[5]);
+      json += "{\"ssid\":\"" + ssid + "\",\"bssid\":\"" + String(bssid) +
+              "\",\"ch\":" + String(WiFi.channel(i)) +
+              ",\"rssi\":" + String(WiFi.RSSI(i)) +
+              ",\"enc\":" + String((int)WiFi.encryptionType(i)) + "}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    r->send(200, "application/json", json);
   });
 
   server.on("/capture", HTTP_GET, [](AsyncWebServerRequest* r){
