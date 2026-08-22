@@ -369,7 +369,7 @@ function scan(){
     document.getElementById('st').textContent='Found '+arr.length+' AP(s) — tap to select';
   }).catch(e=>{document.getElementById('st').textContent='Scan failed';});
 }
-function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function go(){
   const b=document.getElementById('bssid').value.trim().toUpperCase();
   const c=document.getElementById('ch').value;
