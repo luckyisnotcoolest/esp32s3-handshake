@@ -162,7 +162,7 @@ jobs:
           mkdir -p handshake
           cp handshake.ino handshake/
           # Explicit FQBN for ESP32-S3 N16R8U characteristics
-          FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app,CDCOnBoot=disabled,CPUFreq=240,PSRAM=opi,USBMode=hwcdc,FlashMode=qio,FlashSize=16M,DebugLevel=none,UploadSpeed=921600"
+          FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app,CDCOnBoot=default,CPUFreq=240,PSRAM=opi,USBMode=hwcdc,FlashMode=qio,FlashSize=16M,DebugLevel=none,UploadSpeed=921600"
           echo "FQBN=$FQBN"
           arduino-cli compile --fqbn "$FQBN" --output-dir build handshake
           ls -lh build/
