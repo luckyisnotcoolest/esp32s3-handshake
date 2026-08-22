@@ -64,14 +64,28 @@ jobs:
           READELF=$(find "$TOOLS" -name "xtensa-esp32s3-elf-readelf" -type f | sort -V | tail -1)
           AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar" -type f | sort -V | tail -1)
           OBJDUMP=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objdump" -type f | sort -V | tail -1)
-          LIBNET=$(find "$PKG" -name "libnet80211.a" -path "*/esp32s3/*" -type f | sort -V | tail -1)
+
+          # libnet80211.a lives under different layouts depending on core packaging.
+          # Prefer paths containing "esp32s3", fall back to any match.
+          LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | \
+            grep -i esp32s3 | sort -V | tail -1 || true)
+          if [ -z "$LIBNET" ]; then
+            LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | sort -V | tail -1 || true)
+          fi
 
           [ -x "$OBJCOPY" ] || { echo "FATAL: objcopy missing"; exit 1; }
           [ -x "$NM" ]      || { echo "FATAL: nm missing"; exit 1; }
           [ -x "$READELF" ] || { echo "FATAL: readelf missing"; exit 1; }
           [ -x "$AR" ]      || { echo "FATAL: ar missing"; exit 1; }
           [ -x "$OBJDUMP" ] || { echo "FATAL: objdump missing"; exit 1; }
-          [ -f "$LIBNET" ]  || { echo "FATAL: libnet80211.a missing"; exit 1; }
+          [ -f "$LIBNET" ]  || {
+            echo "FATAL: libnet80211.a missing"
+            echo "=== Searching entire package tree ==="
+            find "$PKG" -name "libnet80211.a" -type f 2>/dev/null || true
+            find "$PKG" -name "*.a" \( -path "*wifi*" -o -path "*net802*" \) -type f 2>/dev/null | head -30 || true
+            ls -la "$PKG" || true
+            exit 1
+          }
 
           echo "OBJCOPY=$OBJCOPY" >> $GITHUB_ENV
           echo "NM=$NM"           >> $GITHUB_ENV
