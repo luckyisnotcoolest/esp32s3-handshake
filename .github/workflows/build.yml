@@ -1,318 +1,198 @@
-name: Build handshake v2.0
+name: Build handshake.ino (ESP32-S3 N16R8U)
 
 on:
   push:
     branches: [main, master]
-    paths:
-      - 'handshake.ino'
-      - '.github/workflows/build.yml'
-  pull_request:
-    paths:
-      - 'handshake.ino'
   workflow_dispatch:
 
 jobs:
   build:
-    name: Compile for ESP32-S3 N16R8
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
     steps:
-      # ── 1. Checkout ───────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── 2. arduino-cli ────────────────────────────────────────────────────
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      # ── 3. Install ESP32 Arduino core 3.3.5 ──────────────────────────────
-      - name: Install ESP32 core
+      - name: Cache toolchain + libs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15/packages/esp32
+            ~/Arduino/libraries
+          key: esp32-3.3.11-${{ hashFiles('build.yml') }}
+
+      - name: Install ESP32 core 3.3.11
         run: |
           set -euo pipefail
           arduino-cli config init --overwrite
           arduino-cli config set board_manager.additional_urls \
             https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.5
-          arduino-cli core list
+          arduino-cli core install esp32:esp32@3.3.11
+          arduino-cli core list | grep -q "esp32:esp32.*3.3.11" || {
+            echo "FATAL: core 3.3.11 not installed"; exit 1;
+          }
 
-      # ── 4. Install libraries ──────────────────────────────────────────────
-      - name: Install libraries
-        env:
-          GIT_TERMINAL_PROMPT: "0"
+      - name: Install Async libraries (pinned tags)
         run: |
           set -euo pipefail
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
-          rm -rf "$LIBDIR/AsyncTCP" "$LIBDIR/ESPAsyncWebServer"
-          git clone --depth 1 \
-            https://github.com/ESP32Async/AsyncTCP.git \
-            "$LIBDIR/AsyncTCP"
-          git clone --depth 1 \
-            https://github.com/ESP32Async/ESPAsyncWebServer.git \
-            "$LIBDIR/ESPAsyncWebServer"
-          arduino-cli lib install "Adafruit NeoPixel" || \
-            arduino-cli lib install "Adafruit NeoPixel" --overwrite
-          echo "=== Installed libraries ==="
-          ls -la "$LIBDIR"
+          # Pin to released tags — fail hard if checkout fails
+          if [ ! -d "$LIBDIR/AsyncTCP" ]; then
+            git clone --branch v3.5.0 --depth 1 \
+              https://github.com/ESP32Async/AsyncTCP.git "$LIBDIR/AsyncTCP"
+          fi
+          if [ ! -d "$LIBDIR/ESPAsyncWebServer" ]; then
+            git clone --branch v3.12.0 --depth 1 \
+              https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
+          fi
+          # Sanity: confirm we landed on the expected tags
+          git -C "$LIBDIR/AsyncTCP" describe --tags --exact-match
+          git -C "$LIBDIR/ESPAsyncWebServer" describe --tags --exact-match
 
-      # ── 5. Locate toolchain + libnet80211.a ──────────────────────────────
-      - name: Locate toolchain paths
+      - name: Locate toolchain tools (prefer version-sorted, explicit)
         run: |
           set -euo pipefail
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
           PKG="$HOME/.arduino15/packages/esp32"
-          set +e
-          OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f 2>/dev/null | head -1)
-          NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm" -type f 2>/dev/null | head -1)
-          AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar" -type f 2>/dev/null | head -1)
-          READELF=$(find "$TOOLS" -name "xtensa-esp32s3-elf-readelf" -type f 2>/dev/null | head -1)
-          LIBNET=$(find "$PKG" -name "libnet80211.a" -path "*/esp32s3/*" -type f 2>/dev/null | head -1)
-          [ -z "$LIBNET" ] && LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | head -1)
-          set -e
-          echo "OBJCOPY : ${OBJCOPY:-NOT FOUND}"
-          echo "NM      : ${NM:-NOT FOUND}"
-          echo "AR      : ${AR:-NOT FOUND}"
-          echo "READELF : ${READELF:-NOT FOUND}"
-          echo "LIBNET  : ${LIBNET:-NOT FOUND}"
-          [ -z "$OBJCOPY" ] && { echo "FATAL: objcopy not found"; exit 1; }
-          [ -z "$LIBNET" ] && { echo "FATAL: libnet80211.a not found"; exit 1; }
-          echo "OBJCOPY=$OBJCOPY" >> "$GITHUB_ENV"
-          echo "NM=$NM" >> "$GITHUB_ENV"
-          echo "AR=${AR:-}" >> "$GITHUB_ENV"
-          echo "READELF=${READELF:-}" >> "$GITHUB_ENV"
-          echo "LIBNET=$LIBNET" >> "$GITHUB_ENV"
 
-      # ── 6. QUADRUPLE PATCH libnet80211.a (IDF 5.5 validated) ─────────────
-      # M1: Symbol weaken — legacy compat, fails alone on IDF 5.5
-      # M2: Hex patch .o — fallback for older instruction layouts
-      # M3: Linker --wrap injection — compile-time override
-      # M4: ELF ret0.bin post-patch — gold standard for IDF 5.5 (step 9)
-      - name: Patch libnet80211.a + inject linker wrap
+          # Prefer the highest versioned toolchain that contains the tools
+          OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f | sort -V | tail -1)
+          NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm" -type f | sort -V | tail -1)
+          READELF=$(find "$TOOLS" -name "xtensa-esp32s3-elf-readelf" -type f | sort -V | tail -1)
+          AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar" -type f | sort -V | tail -1)
+          OBJDUMP=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objdump" -type f | sort -V | tail -1)
+          LIBNET=$(find "$PKG" -name "libnet80211.a" -path "*/esp32s3/*" -type f | sort -V | tail -1)
+
+          [ -x "$OBJCOPY" ] || { echo "FATAL: objcopy missing"; exit 1; }
+          [ -x "$NM" ]      || { echo "FATAL: nm missing"; exit 1; }
+          [ -x "$READELF" ] || { echo "FATAL: readelf missing"; exit 1; }
+          [ -x "$AR" ]      || { echo "FATAL: ar missing"; exit 1; }
+          [ -x "$OBJDUMP" ] || { echo "FATAL: objdump missing"; exit 1; }
+          [ -f "$LIBNET" ]  || { echo "FATAL: libnet80211.a missing"; exit 1; }
+
+          echo "OBJCOPY=$OBJCOPY" >> $GITHUB_ENV
+          echo "NM=$NM"           >> $GITHUB_ENV
+          echo "READELF=$READELF" >> $GITHUB_ENV
+          echo "AR=$AR"           >> $GITHUB_ENV
+          echo "OBJDUMP=$OBJDUMP" >> $GITHUB_ENV
+          echo "LIBNET=$LIBNET"   >> $GITHUB_ENV
+
+          echo "Selected tools:"
+          echo "  OBJCOPY=$OBJCOPY"
+          echo "  NM=$NM"
+          echo "  READELF=$READELF"
+          echo "  AR=$AR"
+          echo "  OBJDUMP=$OBJDUMP"
+          echo "  LIBNET=$LIBNET"
+
+      - name: Identify referencing object inside libnet80211.a
         run: |
           set -euo pipefail
-          cp "$LIBNET" "${LIBNET}.bak"
-          M1=0
-          M2=0
-          M3=0
-
-          GATE_SYMBOLS=(
-            "ieee80211_raw_frame_sanity_check"
-            "ieee80211_output_check"
-            "ieee80211_mgmt_tx_check"
-            "ieee80211_tx_sanity_check"
-            "wifi_tx_sanity_check"
-          )
-
-          # ── M1: Multi-symbol weaken ───────────────────────────────────────
-          echo "=== M1: Symbol Weakening ==="
-          if [ -n "$NM" ] && [ -x "$NM" ]; then
-            CURRENT_LIB="$LIBNET"
-            for SYM in "${GATE_SYMBOLS[@]}"; do
-              set +e
-              MATCH=$("$NM" "$CURRENT_LIB" 2>/dev/null \
-                | grep "$SYM" \
-                | grep -cE " [Tt] ")
-              set -e
-              if [ "${MATCH:-0}" -gt 0 ]; then
-                "$OBJCOPY" \
-                  --weaken-symbol="$SYM" \
-                  "$CURRENT_LIB" "${CURRENT_LIB}.tmp"
-                mv "${CURRENT_LIB}.tmp" "$CURRENT_LIB"
-                echo "  Weakened: $SYM"
-                M1=$((M1 + 1))
-              else
-                echo "  Not found: $SYM"
-              fi
-            done
-            echo "M1 result: $M1 symbol(s) weakened"
-          else
-            echo "M1: nm not available — skipping"
-          fi
-
-          # ── M2: Hex patch ieee80211_output.o ─────────────────────────────
-          echo "=== M2: Hex Pattern Patching ==="
-          if [ -n "$AR" ] && [ -x "$AR" ]; then
-            WORKDIR=$(mktemp -d)
-            cp "$LIBNET" "$WORKDIR/libnet80211.a"
-            pushd "$WORKDIR" > /dev/null
-            "$AR" x libnet80211.a ieee80211_output.o 2>/dev/null || true
-            if [ -f ieee80211_output.o ]; then
-              COUNT=$(python3 -c '
-          import pathlib
-          data = pathlib.Path("ieee80211_output.o").read_bytes()
-          pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
-          print(data.count(pattern))
-          ')
-              echo "  Pattern matches: $COUNT"
-              if [ "$COUNT" = "1" ]; then
-                python3 -c '
-          import pathlib
-          p = pathlib.Path("ieee80211_output.o")
-          data = bytearray(p.read_bytes())
-          pattern = bytes([0x36, 0x41, 0x00, 0x0D, 0xF0])
-          idx = data.index(pattern)
-          data[idx] = 0x06
-          p.write_bytes(data)
-          print("  Patched MOVI a4,1→0 at offset 0x{:x}".format(idx))
-          '
-                "$AR" rcs libnet80211.a ieee80211_output.o
-                cp libnet80211.a "$LIBNET"
-                M2=1
-                echo "M2 result: hex patch applied OK"
-              elif [ "$COUNT" = "0" ]; then
-                echo "M2 result: pattern not found (layout changed or already patched)"
-              else
-                echo "M2 result: ambiguous ($COUNT matches) — skipping"
-              fi
-            else
-              echo "M2 result: ieee80211_output.o not found in archive"
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          cd "$TMP"
+          "$AR" x "$LIBNET"
+          echo "=== Objects that reference ieee80211_raw_frame_sanity_check ==="
+          REF_OBJS=""
+          for o in *.o; do
+            if "$NM" "$o" 2>/dev/null | grep -q "ieee80211_raw_frame_sanity_check"; then
+              echo "  $o"
+              REF_OBJS="$REF_OBJS $o"
+              "$NM" "$o" | grep "ieee80211_raw_frame_sanity_check" || true
             fi
-            popd > /dev/null
-            rm -rf "$WORKDIR"
-          else
-            echo "M2: ar not available — skipping"
+          done
+          if [ -z "$REF_OBJS" ]; then
+            echo "WARN: no object inside archive references the symbol"
           fi
+          echo "REF_OBJS=$REF_OBJS" >> $GITHUB_ENV
 
-          # ── M3: Inject --wrap into platform.txt ───────────────────────────
-          echo "=== M3: Linker --wrap Injection ==="
-          PLATFORM_TXT=$(find "$HOME/.arduino15/packages/esp32" \
-            -name "platform.txt" -path "*esp32*" -type f 2>/dev/null | head -1)
-          if [ -n "$PLATFORM_TXT" ] && [ -f "$PLATFORM_TXT" ]; then
-            WRAP_FLAG="-Wl,--wrap=ieee80211_raw_frame_sanity_check"
-            if ! grep -qF "$WRAP_FLAG" "$PLATFORM_TXT"; then
-              sed -i "s|compiler.c.elf.extra_flags=|compiler.c.elf.extra_flags=$WRAP_FLAG |" \
-                "$PLATFORM_TXT"
-              M3=1
-              echo "M3 result: --wrap flag injected into platform.txt"
-            else
-              M3=1
-              echo "M3 result: --wrap flag already present"
-            fi
-          else
-            echo "M3 result: platform.txt not found — manual --wrap may be needed"
-          fi
-
-          # ── M4 prep: generate ret0.bin for ELF post-patch ─────────────────
-          echo "=== M4 Prep: Generate ret0.bin ==="
-          printf '\x02\x20\x00\x0D\xF0' > /tmp/ret0.bin
-          echo "  ret0.bin generated ($(stat -c%s /tmp/ret0.bin) bytes)"
-          echo "  Will be applied to ELF in post-compile step"
-
-          echo "=== Pre-compile summary: M1=$M1 M2=$M2 M3=$M3 ==="
-
-      # ── 7. Prepare sketch folder ──────────────────────────────────────────
-      - name: Prepare sketch folder
+      - name: Patch archive — weaken + inject strong override object
         run: |
           set -euo pipefail
-          rm -rf handshake
+          # Strategy: weaken the library definition so our strong definition
+          # (provided by the sketch) can win at link time. This is not
+          # equivalent to --wrap; it relies on the linker preferring a
+          # strong global over a weak one when both are present.
+          echo "=== BEFORE patch ==="
+          "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
+
+          "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check \
+            "$LIBNET" "$LIBNET.patched"
+          mv "$LIBNET.patched" "$LIBNET"
+
+          echo "=== AFTER weaken ==="
+          AFTER=$("$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true)
+          echo "$AFTER"
+
+          # Require the symbol to actually be weak (W/w). Reject residual T/t.
+          if echo "$AFTER" | grep -qE " [Tt] "; then
+            echo "FATAL: symbol still GLOBAL/TEXT after weaken"
+            exit 1
+          fi
+          if ! echo "$AFTER" | grep -qE " [Ww] "; then
+            echo "FATAL: symbol did not become weak (W/w) after --weaken-symbol"
+            exit 1
+          fi
+          echo "Weaken verified: symbol is now weak"
+
+          # Sanity: archive still valid
+          "$AR" t "$LIBNET" >/dev/null || { echo "FATAL: archive corrupted after patch"; exit 1; }
+          echo "Archive integrity OK"
+
+      - name: Compile
+        run: |
+          set -euo pipefail
           mkdir -p handshake
           cp handshake.ino handshake/
-          ls -lh handshake/
-
-      # ── 8. Compile ────────────────────────────────────────────────────────
-      - name: Compile ESP32-S3 N16R8
-        run: |
-          set -euo pipefail
-          FQBN="esp32:esp32:esp32s3:EraseFlash=none,PartitionScheme=huge_app,CDCOnBoot=default,CPUFreq=240,PSRAM=opi,USBMode=hwcdc,FlashMode=qio,FlashSize=16M,DebugLevel=none,UploadSpeed=921600"
-          echo "FQBN: $FQBN"
-          arduino-cli compile \
-            --fqbn "$FQBN" \
-            --output-dir build \
-            --verbose \
-            handshake
-          echo "=== Build outputs ==="
+          # Explicit FQBN for ESP32-S3 N16R8U characteristics
+          FQBN="esp32:esp32:esp32s3:PartitionScheme=huge_app,CDCOnBoot=disabled,CPUFreq=240,PSRAM=opi,USBMode=hwcdc,FlashMode=qio,FlashSize=16M,DebugLevel=none,UploadSpeed=921600"
+          echo "FQBN=$FQBN"
+          arduino-cli compile --fqbn "$FQBN" --output-dir build handshake
           ls -lh build/
 
-      # ── 9. M4: ELF-level ret0.bin post-patch (IDF 5.5 gold standard) ─────
-      - name: ELF ret0.bin post-patch
+      - name: Verify symbol resolution in final ELF
         run: |
           set -euo pipefail
-          ELF_FILE=$(find build/ -name "*.elf" -type f 2>/dev/null | head -1)
-          if [ -z "$ELF_FILE" ]; then
-            echo "WARNING: No ELF found — skipping M4"
-            exit 0
+          ELF=$(find build -name "*.elf" | sort | head -1)
+          [ -f "$ELF" ] || { echo "FATAL: ELF not found"; exit 1; }
+          echo "ELF: $ELF"
+
+          # 1. Symbol table: must be defined (T/t), not undefined (U)
+          SYM=$("$NM" "$ELF" | grep -w "ieee80211_raw_frame_sanity_check" || true)
+          echo "Symbol line: $SYM"
+          [ -n "$SYM" ] || { echo "FATAL: symbol absent from ELF"; exit 1; }
+          if echo "$SYM" | grep -qE " [Uu] "; then
+            echo "FATAL: symbol is undefined reference — override did not bind"
+            exit 1
           fi
-          echo "Target ELF: $ELF_FILE"
-
-          SANITY_VIRT=$(readelf -s "$ELF_FILE" 2>/dev/null \
-            | grep "ieee80211_raw_frame_sanity_check" \
-            | awk '{print "0x"$2}' | head -1)
-
-          if [ -z "$SANITY_VIRT" ] || [ "$SANITY_VIRT" = "0x" ]; then
-            echo "WARNING: Symbol not in ELF — M1+M3 should still provide bypass"
-            exit 0
+          if ! echo "$SYM" | grep -qE " [Tt] "; then
+            echo "FATAL: unexpected binding (expected T/t): $SYM"
+            exit 1
           fi
-          echo "Symbol virt: $SANITY_VIRT"
+          echo "Symbol is defined (T/t) in final binary"
 
-          FLASH_BASE=$(readelf -S "$ELF_FILE" 2>/dev/null \
-            | grep -E "\.(flash\.)?text" \
-            | awk '{print "0x"$4 " + 0x"$5}' | head -1)
+          # 2. Relocation analysis: show how references were resolved
+          echo "=== Relocations referencing the symbol ==="
+          "$READELF" -r "$ELF" 2>/dev/null | grep -A2 -B2 "ieee80211_raw_frame_sanity_check" || \
+            echo "(no dynamic relocations shown; static resolution expected)"
 
-          if [ -z "$FLASH_BASE" ]; then
-            echo "WARNING: Text section not found — skipping M4"
-            exit 0
-          fi
-          echo "Text base: $FLASH_BASE"
+          # 3. Disassembly of the override itself (proof it is our code)
+          echo "=== Disassembly of override function ==="
+          "$OBJDUMP" -d "$ELF" 2>/dev/null | \
+            awk '/<ieee80211_raw_frame_sanity_check>:/,/^$/' | head -40 || true
 
-          OFFSET=$(python3 -c "print($SANITY_VIRT - ($FLASH_BASE))")
-          PATCH_SIZE=$(stat -c%s /tmp/ret0.bin)
+          # 4. Confirm archive still contains only weak definition
+          echo "=== Library symbol state (post-link) ==="
+          "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
 
-          cp "$ELF_FILE" "${ELF_FILE}.unpatched"
-          dd conv=notrunc if=/tmp/ret0.bin of="$ELF_FILE" \
-            bs=1 count="$PATCH_SIZE" seek="$OFFSET" 2>/dev/null
+          echo "Verification complete: strong definition present; library definition remains weak"
 
-          VERIFY=$(xxd -s "$OFFSET" -l "$PATCH_SIZE" "$ELF_FILE" \
-            | awk '{print $2$3}')
-          if [ "$VERIFY" = "0220000df0" ]; then
-            echo "M4 result: ELF patch VERIFIED at offset $OFFSET"
-          else
-            echo "M4 result: verification mismatch (got $VERIFY)"
-          fi
-
-      # ── 10. Upload artifacts ──────────────────────────────────────────────
-      - name: Upload firmware artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: handshake-v2.0-${{ github.sha }}
+          name: handshake-n16r8u
           path: build/
           retention-days: 30
-
-      # ── 11. Flash instructions ────────────────────────────────────────────
-      - name: Flash instructions
-        run: |
-          cat << 'FLASHEOF'
-          ════════════════════════════════════════════════════════
-           HandshakeSniffer v2.0 — Flash Instructions
-          ════════════════════════════════════════════════════════
-          Recommended (single merged image):
-            esptool.py --chip esp32s3 --port /dev/ttyUSB0 \
-              --baud 921600 write_flash \
-              --flash_mode qio --flash_freq 80m --flash_size 16MB \
-              0x0 handshake.ino.merged.bin
-          Manual (three parts):
-            0x0000  handshake.ino.bootloader.bin
-            0x8000  handshake.ino.partitions.bin
-            0x10000 handshake.ino.bin
-          AP SSID : HandshakeSniffer
-          AP Pass : sniff1234
-          Web UI  : http://192.168.4.1/
-          Heap    : http://192.168.4.1/heap
-          Status  : http://192.168.4.1/status
-          Clients : http://192.168.4.1/clients
-          Spark   : http://192.168.4.1/spark
-          NEW in v2.0:
-            - Per-client session table (up to 16 concurrent)
-            - Beacon PMKID extraction (no deauth needed on cached APs)
-            - Unicast + broadcast deauth combo
-            - Configurable reason code (1/3/7/8/15)
-            - Configurable inter-frame gap (50/100/200µs)
-            - Continuous deauth mode with interval control
-            - Live capture sparkline graph
-            - Connected clients panel with per-client deauth
-            - Dark/light mode toggle (persists across sessions)
-            - Keyboard shortcuts: S=scan D=deauth Esc=stop
-            - All sessions exported in single 22000 file
-            - RSSI in radiotap headers (Wireshark signal display)
-          ════════════════════════════════════════════════════════
-          FLASHEOF
