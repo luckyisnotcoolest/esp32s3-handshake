@@ -39,16 +39,14 @@ jobs:
           set -euo pipefail
           LIBDIR="$HOME/Arduino/libraries"
           mkdir -p "$LIBDIR"
-          # Pin to released tags — fail hard if checkout fails
-          if [ ! -d "$LIBDIR/AsyncTCP" ]; then
-            git clone --branch v3.5.0 --depth 1 \
-              https://github.com/ESP32Async/AsyncTCP.git "$LIBDIR/AsyncTCP"
-          fi
-          if [ ! -d "$LIBDIR/ESPAsyncWebServer" ]; then
-            git clone --branch v3.12.0 --depth 1 \
-              https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
-          fi
-          # Sanity: confirm we landed on the expected tags
+          # Pin to a known-compatible pair that accepts the classic
+          # beginResponse(contentType, len, filler) overload.
+          # Always remove first so cache cannot leave a newer version.
+          rm -rf "$LIBDIR/AsyncTCP" "$LIBDIR/ESPAsyncWebServer"
+          git clone --branch v3.3.2 --depth 1 \
+            https://github.com/ESP32Async/AsyncTCP.git "$LIBDIR/AsyncTCP"
+          git clone --branch v3.6.0 --depth 1 \
+            https://github.com/ESP32Async/ESPAsyncWebServer.git "$LIBDIR/ESPAsyncWebServer"
           git -C "$LIBDIR/AsyncTCP" describe --tags --exact-match
           git -C "$LIBDIR/ESPAsyncWebServer" describe --tags --exact-match
 
